@@ -1,0 +1,25 @@
+[package]
+name = "stremio-service-rs"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+anyhow = "1"
+axum = { version = "0.8", features = ["macros", "json"] }
+bytes = "1"
+chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
+futures-util = "0.3"
+http = "1"
+librqbit = { version = "8.1.1", default-features = false, features = ["default-tls"] }
+mime_guess = "2"
+percent-encoding = "2"
+regex = "1"
+reqwest = { version = "0.12", features = ["brotli", "deflate", "gzip", "stream"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tokio = { version = "1", features = ["fs", "io-util", "macros", "net", "rt-multi-thread", "signal", "time"] }
+tokio-util = { version = "0.7", features = ["io"] }
+tower-http = { version = "0.6", features = ["cors", "trace"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
+url = "2"

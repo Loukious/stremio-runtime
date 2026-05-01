@@ -426,7 +426,8 @@ async fn main() -> anyhow::Result<()> {
     let app = router(state);
 
     info!("{STARTUP_NAME} listening on {base_url}");
-    println!("-> {STARTUP_NAME} listening at {base_url}");
+    // this line is needed for the service to work with non-modified Stremio clients, as they rely on it to detect the server and get its URL
+    println!("EngineFS server started at {base_url}");
     axum::serve(listener, app).await.context("serving HTTP")?;
     Ok(())
 }

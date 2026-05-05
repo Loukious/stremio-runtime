@@ -6,7 +6,7 @@ use std::{
     pin::Pin,
     sync::Arc,
     task::{Context as TaskContext, Poll},
-    time::{Duration, Instant},
+    time::{Duration, Instant, SystemTime},
 };
 
 use anyhow::{Context, anyhow};
@@ -28,8 +28,7 @@ use chrono::{SecondsFormat, Utc};
 use futures_util::stream::Stream;
 use librqbit::{
     AddTorrent, AddTorrentOptions, ConnectionOptions, ListenerOptions, Magnet,
-    PeerConnectionOptions, Session, SessionOptions,
-    api::TorrentIdOrHash,
+    PeerConnectionOptions, Session, SessionOptions, api::TorrentIdOrHash,
 };
 use percent_encoding::{AsciiSet, CONTROLS, utf8_percent_encode};
 use regex::RegexBuilder;
@@ -60,6 +59,7 @@ const STREAM_OPEN_TIMEOUT: Duration = Duration::from_secs(10);
 const CREATE_METADATA_GRACE: Duration = Duration::from_millis(1500);
 const ENGINE_INACTIVITY_TIMEOUT: Duration = Duration::from_secs(2 * 60);
 const ENGINE_CLEANUP_INTERVAL: Duration = Duration::from_secs(10);
+const CACHE_REAPER_INTERVAL: Duration = Duration::from_secs(60);
 
 // ── Streaming window tuning ───────────────────────────────────────────────────
 // How far ahead of the read cursor the download scheduler should prioritise.
@@ -126,6 +126,14 @@ struct TorrentService {
     cache_dir: PathBuf,
 }
 
+#[derive(Debug)]
+struct CacheEntry {
+    key: String,
+    path: PathBuf,
+    size: u64,
+    modified: SystemTime,
+}
+
 struct SettingsStore {
     path: PathBuf,
     values: RwLock<Map<String, Value>>,
@@ -188,6 +196,11 @@ impl SettingsStore {
         if let Err(err) = self.save().await {
             warn!(path = %self.path.display(), error = %err, "saving settings failed");
         }
+    }
+
+    async fn cache_size_limit(&self) -> Option<u64> {
+        let values = self.values.read().await;
+        cache_size_limit_from_settings(&values)
     }
 }
 
@@ -477,6 +490,22 @@ async fn main() -> anyhow::Result<()> {
         });
     }
 
+    {
+        let cache_reaper = torrents.clone();
+        let settings_for_reaper = settings.clone();
+        tokio::spawn(async move {
+            cache_reaper
+                .cleanup_cache_to_limit(&settings_for_reaper)
+                .await;
+            loop {
+                sleep(CACHE_REAPER_INTERVAL).await;
+                cache_reaper
+                    .cleanup_cache_to_limit(&settings_for_reaper)
+                    .await;
+            }
+        });
+    }
+
     let listener = bind_http_listener(http_start_port(), 5).await?;
     let addr = listener.local_addr()?;
     let base_host = discover_ipv4_interfaces()
@@ -622,7 +651,10 @@ fn default_settings_values(app_path: &Path) -> Map<String, Value> {
     };
 
     serde_json::Map::from_iter([
-        ("serverVersion".to_string(), json!(env!("CARGO_PKG_VERSION"))),
+        (
+            "serverVersion".to_string(),
+            json!(env!("CARGO_PKG_VERSION")),
+        ),
         ("appPath".to_string(), json!(app_path)),
         ("cacheRoot".to_string(), json!(cache_root)),
         ("cacheSize".to_string(), cache_size),
@@ -674,7 +706,10 @@ fn normalize_settings_values(values: &mut Map<String, Value>, app_path: &Path) {
     if std::env::var("DISABLE_CACHING").is_ok() {
         values.insert("cacheSize".to_string(), json!(0));
     } else {
-        let valid = matches!(values.get("cacheSize"), Some(Value::Number(_)) | Some(Value::Null));
+        let valid = matches!(
+            values.get("cacheSize"),
+            Some(Value::Number(_)) | Some(Value::Null)
+        );
         if !valid {
             values.insert("cacheSize".to_string(), json!(2147483648u64));
         }
@@ -739,6 +774,18 @@ fn cache_dir_from_settings(values: &Map<String, Value>) -> PathBuf {
         return std::env::temp_dir().join("stremio-cache");
     }
     PathBuf::from(cache_root).join("stremio-cache")
+}
+
+fn cache_size_limit_from_settings(values: &Map<String, Value>) -> Option<u64> {
+    match values.get("cacheSize") {
+        Some(Value::Null) => None,
+        Some(Value::Number(n)) => n.as_u64().or_else(|| {
+            n.as_f64()
+                .filter(|v| v.is_finite() && *v >= 0.0)
+                .map(|v| v as u64)
+        }),
+        _ => Some(2147483648u64),
+    }
 }
 
 fn http_start_port() -> u16 {
@@ -881,6 +928,13 @@ async fn post_settings(State(state): State<AppState>, body: Bytes) -> AppResult<
             .unwrap_or_else(server_app_path)
     };
     state.settings.update(patch, &app_path).await;
+    {
+        let torrents = state.torrents.clone();
+        let settings = state.settings.clone();
+        tokio::spawn(async move {
+            torrents.cleanup_cache_to_limit(&settings).await;
+        });
+    }
     Ok(Json(json!({ "success": true })))
 }
 
@@ -1003,7 +1057,10 @@ async fn subtitles_proxy(
                     {
                         let headers = response.headers_mut().expect("headers exist");
                         headers.insert(CONTENT_TYPE, HeaderValue::from_static(content_type));
-                        headers.insert(CACHE_CONTROL, HeaderValue::from_static("public, max-age=86400"));
+                        headers.insert(
+                            CACHE_CONTROL,
+                            HeaderValue::from_static("public, max-age=86400"),
+                        );
                         if let Some(disposition) = upstream_disposition
                             .as_deref()
                             .and_then(|value| HeaderValue::from_str(value).ok())
@@ -1124,10 +1181,7 @@ async fn create_magnet(
         .add_magnet(&info_hash, &request, query_trackers)
         .await?;
 
-    state
-        .torrents
-        .touch(&handle.info_hash().as_string())
-        .await;
+    state.torrents.touch(&handle.info_hash().as_string()).await;
 
     let _ = timeout(CREATE_METADATA_GRACE, handle.wait_until_initialized()).await;
     let filters = if query_filters.is_empty() {
@@ -1288,16 +1342,28 @@ async fn stream_common(
 
     let handle = state
         .torrents
-        .get_or_add_magnet(&normalized_info_hash, query.trackers.clone(), initial_file_idx)
+        .get_or_add_magnet(
+            &normalized_info_hash,
+            query.trackers.clone(),
+            initial_file_idx,
+        )
         .await?;
 
-    info!(info_hash, elapsed_ms = t0.elapsed().as_millis(), "[TIMING] torrent handle acquired");
+    info!(
+        info_hash,
+        elapsed_ms = t0.elapsed().as_millis(),
+        "[TIMING] torrent handle acquired"
+    );
 
     // ── Wait for metadata / initial check ─────────────────────────────────────
     match timeout(STREAM_INIT_TIMEOUT, handle.wait_until_initialized()).await {
         Ok(Ok(())) => {}
         Ok(Err(err)) => {
-            warn!(info_hash, "[TIMING] torrent initialization failed after {}ms: {err:#}", t0.elapsed().as_millis());
+            warn!(
+                info_hash,
+                "[TIMING] torrent initialization failed after {}ms: {err:#}",
+                t0.elapsed().as_millis()
+            );
             return Ok((
                 StatusCode::SERVICE_UNAVAILABLE,
                 [("Retry-After", "5")],
@@ -1306,7 +1372,11 @@ async fn stream_common(
                 .into_response());
         }
         Err(_elapsed) => {
-            warn!(info_hash, "[TIMING] timed out waiting for torrent metadata after {}ms", t0.elapsed().as_millis());
+            warn!(
+                info_hash,
+                "[TIMING] timed out waiting for torrent metadata after {}ms",
+                t0.elapsed().as_millis()
+            );
             return Ok((
                 StatusCode::SERVICE_UNAVAILABLE,
                 [("Retry-After", "5")],
@@ -1316,7 +1386,11 @@ async fn stream_common(
         }
     }
 
-    info!(info_hash, elapsed_ms = t0.elapsed().as_millis(), "[TIMING] wait_until_initialized done");
+    info!(
+        info_hash,
+        elapsed_ms = t0.elapsed().as_millis(),
+        "[TIMING] wait_until_initialized done"
+    );
 
     let file_idx = resolve_file_index(&handle, &idx, &query.filters)?;
     let file = file_for_handle(&handle, file_idx)?.context("torrent file not found")?;
@@ -1369,22 +1443,31 @@ async fn stream_common(
         STREAM_WINDOW_BACKWARD
     };
 
-    let _ = handle.update_streaming_window(
-        file_idx,
-        start,
-        initial_backward,
-        STREAM_WINDOW_FORWARD,
-    );
+    let _ =
+        handle.update_streaming_window(file_idx, start, initial_backward, STREAM_WINDOW_FORWARD);
 
-    info!(info_hash, elapsed_ms = t0.elapsed().as_millis(), "[TIMING] calling stream()");
+    info!(
+        info_hash,
+        elapsed_ms = t0.elapsed().as_millis(),
+        "[TIMING] calling stream()"
+    );
 
     let mut stream = match timeout(STREAM_OPEN_TIMEOUT, handle.clone().stream(file_idx)).await {
         Ok(Ok(s)) => {
-            info!(info_hash, elapsed_ms = t0.elapsed().as_millis(), "[TIMING] stream() opened");
+            info!(
+                info_hash,
+                elapsed_ms = t0.elapsed().as_millis(),
+                "[TIMING] stream() opened"
+            );
             s
         }
         Ok(Err(err)) => {
-            warn!(info_hash, file_idx, elapsed_ms = t0.elapsed().as_millis(), "[TIMING] stream() failed: {err:#}");
+            warn!(
+                info_hash,
+                file_idx,
+                elapsed_ms = t0.elapsed().as_millis(),
+                "[TIMING] stream() failed: {err:#}"
+            );
             return Ok((
                 StatusCode::SERVICE_UNAVAILABLE,
                 [("Retry-After", "2")],
@@ -1393,7 +1476,13 @@ async fn stream_common(
                 .into_response());
         }
         Err(_elapsed) => {
-            warn!(info_hash, file_idx, start, elapsed_ms = t0.elapsed().as_millis(), "[TIMING] stream() timed out — pieces not yet available");
+            warn!(
+                info_hash,
+                file_idx,
+                start,
+                elapsed_ms = t0.elapsed().as_millis(),
+                "[TIMING] stream() timed out — pieces not yet available"
+            );
             return Ok((
                 StatusCode::SERVICE_UNAVAILABLE,
                 [("Retry-After", "3")],
@@ -1404,13 +1493,29 @@ async fn stream_common(
     };
 
     if start > 0 {
-        info!(info_hash, start, elapsed_ms = t0.elapsed().as_millis(), "[TIMING] calling seek()");
+        info!(
+            info_hash,
+            start,
+            elapsed_ms = t0.elapsed().as_millis(),
+            "[TIMING] calling seek()"
+        );
         match timeout(STREAM_OPEN_TIMEOUT, stream.seek(SeekFrom::Start(start))).await {
             Ok(Ok(_)) => {
-                info!(info_hash, start, elapsed_ms = t0.elapsed().as_millis(), "[TIMING] seek() done");
+                info!(
+                    info_hash,
+                    start,
+                    elapsed_ms = t0.elapsed().as_millis(),
+                    "[TIMING] seek() done"
+                );
             }
             Ok(Err(err)) => {
-                warn!(info_hash, file_idx, start, elapsed_ms = t0.elapsed().as_millis(), "[TIMING] seek() failed: {err:#}");
+                warn!(
+                    info_hash,
+                    file_idx,
+                    start,
+                    elapsed_ms = t0.elapsed().as_millis(),
+                    "[TIMING] seek() failed: {err:#}"
+                );
                 return Ok((
                     StatusCode::SERVICE_UNAVAILABLE,
                     [("Retry-After", "2")],
@@ -1419,7 +1524,13 @@ async fn stream_common(
                     .into_response());
             }
             Err(_elapsed) => {
-                warn!(info_hash, file_idx, start, elapsed_ms = t0.elapsed().as_millis(), "[TIMING] seek() timed out — pieces at offset not available");
+                warn!(
+                    info_hash,
+                    file_idx,
+                    start,
+                    elapsed_ms = t0.elapsed().as_millis(),
+                    "[TIMING] seek() timed out — pieces at offset not available"
+                );
                 return Ok((
                     StatusCode::SERVICE_UNAVAILABLE,
                     [("Retry-After", "5")],
@@ -1586,7 +1697,10 @@ impl TorrentService {
             .context("torrent was not started")?;
 
         let ih = handle.info_hash().as_string();
-        self.handles.write().await.insert(ih.clone(), handle.clone());
+        self.handles
+            .write()
+            .await
+            .insert(ih.clone(), handle.clone());
         self.touch(&ih).await;
         Ok(handle)
     }
@@ -1681,7 +1795,10 @@ impl TorrentService {
             .into_handle()
             .context("torrent was not started")?;
         let ih = handle.info_hash().as_string();
-        self.handles.write().await.insert(ih.clone(), handle.clone());
+        self.handles
+            .write()
+            .await
+            .insert(ih.clone(), handle.clone());
         self.touch(&ih).await;
         Ok(handle)
     }
@@ -1782,6 +1899,238 @@ impl TorrentService {
                 continue;
             }
             info!(info_hash = %hash, "engine destroyed");
+        }
+    }
+
+    async fn cleanup_cache_to_limit(&self, settings: &SettingsStore) {
+        let Some(limit) = settings.cache_size_limit().await else {
+            debug!("cache reaper skipped because cacheSize is unlimited");
+            return;
+        };
+
+        let active_hashes = self.active_cache_keys().await;
+        let (mut total, mut candidates) = match collect_cache_entries(
+            &self.cache_dir,
+            &active_hashes,
+        )
+        .await
+        {
+            Ok(entries) => entries,
+            Err(err) => {
+                warn!(cache_dir = %self.cache_dir.display(), error = %err, "cache reaper scan failed");
+                return;
+            }
+        };
+
+        if total <= limit {
+            debug!(
+                cache_dir = %self.cache_dir.display(),
+                total,
+                limit,
+                "cache reaper skipped; cache is within limit"
+            );
+            return;
+        }
+
+        candidates.sort_by(|a, b| {
+            a.modified
+                .cmp(&b.modified)
+                .then_with(|| a.path.cmp(&b.path))
+        });
+
+        info!(
+            cache_dir = %self.cache_dir.display(),
+            total,
+            limit,
+            candidates = candidates.len(),
+            "cache is over limit; pruning inactive entries"
+        );
+
+        for entry in candidates {
+            if total <= limit {
+                break;
+            }
+
+            match remove_cache_entry(&entry, &self.cache_dir).await {
+                Ok(()) => {
+                    total = total.saturating_sub(entry.size);
+                    info!(
+                        key = %entry.key,
+                        path = %entry.path.display(),
+                        freed = entry.size,
+                        remaining = total,
+                        limit,
+                        "cache entry removed"
+                    );
+                }
+                Err(err) => {
+                    warn!(
+                        key = %entry.key,
+                        path = %entry.path.display(),
+                        error = %err,
+                        "cache entry removal failed"
+                    );
+                }
+            }
+        }
+
+        if total > limit {
+            warn!(
+                cache_dir = %self.cache_dir.display(),
+                total,
+                limit,
+                active = active_hashes.len(),
+                "cache remains over limit; remaining data is active or could not be removed"
+            );
+        }
+    }
+
+    async fn active_cache_keys(&self) -> HashSet<String> {
+        let mut active = self
+            .handles
+            .read()
+            .await
+            .keys()
+            .cloned()
+            .collect::<HashSet<_>>();
+        active.extend(self.active_streams.read().await.keys().cloned());
+        active
+    }
+}
+
+async fn collect_cache_entries(
+    cache_dir: &Path,
+    active_keys: &HashSet<String>,
+) -> anyhow::Result<(u64, Vec<CacheEntry>)> {
+    let mut total = 0u64;
+    let mut candidates = Vec::new();
+
+    let mut entries = match tokio::fs::read_dir(cache_dir).await {
+        Ok(entries) => entries,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok((0, Vec::new())),
+        Err(err) => return Err(err).with_context(|| format!("reading {}", cache_dir.display())),
+    };
+
+    while let Some(entry) = entries
+        .next_entry()
+        .await
+        .with_context(|| format!("reading {}", cache_dir.display()))?
+    {
+        let path = entry.path();
+        let key = entry.file_name().to_string_lossy().to_string();
+
+        // librqbit stores fastresume bitfields here.  We delete per-torrent
+        // bitfields together with the torrent cache entry, but never prune the
+        // session directory as a standalone cache object.
+        if key.eq_ignore_ascii_case("session") {
+            continue;
+        }
+
+        let (size, modified) = cache_entry_stats(&path)
+            .await
+            .with_context(|| format!("scanning cache entry {}", path.display()))?;
+        total = total.saturating_add(size);
+
+        if !active_keys.contains(&key) {
+            candidates.push(CacheEntry {
+                key,
+                path,
+                size,
+                modified,
+            });
+        }
+    }
+
+    Ok((total, candidates))
+}
+
+async fn cache_entry_stats(path: &Path) -> anyhow::Result<(u64, SystemTime)> {
+    let mut size = 0u64;
+    let mut modified = SystemTime::UNIX_EPOCH;
+    let mut stack = vec![path.to_path_buf()];
+
+    while let Some(path) = stack.pop() {
+        let metadata = match tokio::fs::symlink_metadata(&path).await {
+            Ok(metadata) => metadata,
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(err) => return Err(err).with_context(|| format!("stat {}", path.display())),
+        };
+
+        if let Ok(mtime) = metadata.modified() {
+            if mtime > modified {
+                modified = mtime;
+            }
+        }
+
+        if metadata.is_dir() {
+            let mut entries = match tokio::fs::read_dir(&path).await {
+                Ok(entries) => entries,
+                Err(err) if err.kind() == std::io::ErrorKind::NotFound => continue,
+                Err(err) => return Err(err).with_context(|| format!("reading {}", path.display())),
+            };
+
+            while let Some(entry) = entries
+                .next_entry()
+                .await
+                .with_context(|| format!("reading {}", path.display()))?
+            {
+                stack.push(entry.path());
+            }
+        } else if metadata.is_file() {
+            size = size.saturating_add(metadata.len());
+        }
+    }
+
+    Ok((size, modified))
+}
+
+async fn remove_cache_entry(entry: &CacheEntry, cache_dir: &Path) -> anyhow::Result<()> {
+    let canonical_cache = tokio::fs::canonicalize(cache_dir)
+        .await
+        .with_context(|| format!("canonicalizing {}", cache_dir.display()))?;
+    let parent = entry.path.parent().context("cache entry has no parent")?;
+    let canonical_parent = tokio::fs::canonicalize(parent)
+        .await
+        .with_context(|| format!("canonicalizing {}", parent.display()))?;
+
+    if canonical_parent != canonical_cache {
+        anyhow::bail!(
+            "refusing to remove cache entry outside cache root: {}",
+            entry.path.display()
+        );
+    }
+
+    let metadata = match tokio::fs::symlink_metadata(&entry.path).await {
+        Ok(metadata) => metadata,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(err) => return Err(err).with_context(|| format!("stat {}", entry.path.display())),
+    };
+
+    if metadata.is_dir() {
+        tokio::fs::remove_dir_all(&entry.path)
+            .await
+            .with_context(|| format!("removing {}", entry.path.display()))?;
+    } else {
+        tokio::fs::remove_file(&entry.path)
+            .await
+            .with_context(|| format!("removing {}", entry.path.display()))?;
+    }
+
+    remove_fastresume_for_cache_key(cache_dir, &entry.key).await;
+    Ok(())
+}
+
+async fn remove_fastresume_for_cache_key(cache_dir: &Path, key: &str) {
+    if key.len() != 40 || !key.chars().all(|c| c.is_ascii_hexdigit()) {
+        return;
+    }
+
+    let bitv_path = cache_dir.join("session").join(format!("{key}.bitv"));
+    match tokio::fs::remove_file(&bitv_path).await {
+        Ok(()) => debug!(path = %bitv_path.display(), "removed stale fastresume bitfield"),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+        Err(err) => {
+            warn!(path = %bitv_path.display(), error = %err, "failed to remove fastresume bitfield")
         }
     }
 }

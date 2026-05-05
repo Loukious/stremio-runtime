@@ -88,7 +88,7 @@ Legend: ✅ Done · ⚠️ Stub (route exists, returns empty/null) · ❌ TODO
 
 ### Subtitle Routes
 - ✅ `GET /subtitles.{ext}` — full proxy with SRT/VTT parsing, SRT→VTT conversion, and `offset=<ms>`
-- ⚠️ `GET /opensubHash` — returns `{ error: null, result: null }`; hash not computed
+- ✅ `GET /opensubHash` — computes OpenSubtitles hash from `videoUrl=`
 - ✅ `GET /subtitlesTracks` — fetches `subsUrl` and returns parsed cue tracks
 - ❌ `GET /tracks/:url`
 
@@ -140,7 +140,6 @@ Legend: ✅ Done · ⚠️ Stub (route exists, returns empty/null) · ❌ TODO
 
 - [ ] Add conformance tests with captured desktop traffic for create/stats/stream/local-addon flows
 - [ ] Harden local-addon filename parsing and Cinemeta matching for common movie/series release names
-- [ ] `GET /opensubHash` — compute actual OpenSubtitles hash from `videoUrl=`
 - [ ] `ALL /proxy/:opts/:pathname*` — HTTP proxy with playlist URL rewriting for direct URL edge cases
 
 ### P1 (desktop polish / compatibility)
@@ -743,7 +742,7 @@ Response:
 
 Fetches `subsUrl`, parses SRT/VTT cues, and returns timestamped tracks.
 
-### `GET /opensubHash` ⚠️
+### `GET /opensubHash` ✅
 
 Inputs:
 
@@ -763,7 +762,8 @@ Response:
 }
 ```
 
-Currently returns `{ "error": null, "result": null }`. Hash computation not yet implemented.
+Fetches the first and last 64 KiB of `videoUrl` with HTTP range requests and computes the standard
+OpenSubtitles hash.
 
 ### `GET /subtitles.:ext` ✅
 

@@ -146,6 +146,18 @@ Legend: ✅ Done · ⚠️ Stub (route exists, returns empty/null) · ❌ TODO
 - [ ] Better `/settings` parity for every desktop option value the shell may read
 - [ ] More exact `EngineStats` parity for selections, wires, and source counters
 
+## Source Layout
+
+- `src/main.rs` — process bootstrap, shared types, router wiring, and crate-root includes.
+- `src/runtime/settings.rs` — settings persistence, defaults, cache-size helpers, and interface discovery.
+- `src/runtime/local_addon.rs` — local addon catalog/meta/stream handling, file discovery, filename parsing, and Cinemeta matching.
+- `src/runtime/proxy.rs` — `/proxy` option parsing, redirect handling, header forwarding, and playlist rewriting.
+- `src/runtime/opensub.rs` — `/opensubHash` range fetching and OpenSubtitles hash calculation.
+- `src/runtime/subtitles.rs` — subtitle proxying, cue parsing/rendering, offset support, and tracks response.
+- `src/runtime/app_routes.rs` — small app/service routes such as settings, device info, manifest dispatch, and stubs.
+- `src/runtime/torrent_http.rs` — torrent-facing HTTP routes: create, stats, remove, and stream responses.
+- `src/runtime/torrent_service.rs` — torrent service internals, cache reaper, stats shaping, file guessing, and shared request helpers.
+
 ### P2 (casting, HLS, transcoding, and non-desktop clients)
 
 - [ ] `GET /hlsv2/probe` — invoke ffprobe, return HLSv2 format+streams+samples model

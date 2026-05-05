@@ -110,6 +110,26 @@ const DEFAULT_TRACKERS: &[&str] = &[
     "https://tracker.bt4g.com:443/announce",
 ];
 
+const CINEMETA_BASE_URL: &str = "https://v3-cinemeta.strem.io";
+const METAHUB_BASE_URL: &str = "https://images.metahub.space";
+const METAHUB_EPISODES_URL: &str = "https://episodes.metahub.space";
+const CINEMETA_META_FIELDS: &[&str] = &[
+    "imdb_id",
+    "name",
+    "genre",
+    "director",
+    "cast",
+    "poster",
+    "description",
+    "trailers",
+    "background",
+    "logo",
+    "imdbRating",
+    "runtime",
+    "genres",
+    "releaseInfo",
+];
+
 #[derive(Clone)]
 struct AppState {
     torrents: Arc<TorrentService>,
@@ -137,6 +157,30 @@ struct CacheEntry {
 struct SettingsStore {
     path: PathBuf,
     values: RwLock<Map<String, Value>>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ParsedVideoKind {
+    Movie,
+    Series,
+}
+
+impl ParsedVideoKind {
+    fn as_cinemeta_type(self) -> &'static str {
+        match self {
+            Self::Movie => "movie",
+            Self::Series => "series",
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
+struct ParsedVideoName {
+    name: String,
+    year: Option<i32>,
+    season: Option<u32>,
+    episode: Option<u32>,
+    kind: ParsedVideoKind,
 }
 
 impl SettingsStore {
@@ -849,6 +893,355 @@ fn local_addon_resource_payload(
     }
 }
 
+async fn local_addon_bt_meta(state: &AppState, media_type: &str, id: &str) -> AppResult<Value> {
+    let Some(info_hash) = id.strip_prefix("bt:") else {
+        return Ok(json!({ "meta": null }));
+    };
+    let info_hash = normalize_info_hash(info_hash)?;
+    let handle = state
+        .torrents
+        .get_or_add_magnet(&info_hash, Vec::new(), None)
+        .await?;
+
+    let _ = timeout(STREAM_INIT_TIMEOUT, handle.wait_until_initialized()).await;
+    let files = files_for_handle(&handle);
+    if files.is_empty() {
+        return Ok(json!({ "meta": null }));
+    }
+
+    let video_files = files
+        .iter()
+        .enumerate()
+        .filter(|(_, file)| is_video_like(&file.name))
+        .collect::<Vec<_>>();
+    if video_files.is_empty() {
+        return Ok(json!({ "meta": null }));
+    }
+
+    let now = Utc::now();
+    let now_text = now.to_rfc3339_opts(SecondsFormat::Millis, true);
+    let parsed_files = video_files
+        .iter()
+        .map(|(file_idx, file)| (*file_idx, *file, parse_video_filename(&file.name)))
+        .collect::<Vec<_>>();
+    let primary_parsed = parsed_files
+        .iter()
+        .max_by_key(|(_, file, _)| file.length)
+        .and_then(|(_, _, parsed)| parsed.clone());
+
+    let fallback_name = handle.name().unwrap_or_else(|| {
+        primary_parsed
+            .as_ref()
+            .map(|parsed| parsed.name.clone())
+            .or_else(|| {
+                video_files
+                    .iter()
+                    .max_by_key(|(_, file)| file.length)
+                    .map(|(_, file)| display_name_from_filename(&file.name))
+            })
+            .unwrap_or_else(|| info_hash.clone())
+    });
+
+    let enriched = match primary_parsed.as_ref() {
+        Some(parsed) => match fetch_cinemeta_for_parsed(&state.client, parsed).await {
+            Ok(meta) => meta,
+            Err(err) => {
+                debug!(name = %parsed.name, error = %err, "local-addon cinemeta lookup failed");
+                None
+            }
+        },
+        None => None,
+    };
+    let imdb_id = enriched
+        .as_ref()
+        .and_then(|meta| meta.get("imdb_id").or_else(|| meta.get("id")))
+        .and_then(Value::as_str)
+        .map(str::to_owned);
+    let background = imdb_id
+        .as_ref()
+        .map(|imdb_id| format!("{METAHUB_BASE_URL}/background/medium/{imdb_id}/img"));
+
+    let videos = parsed_files
+        .iter()
+        .enumerate()
+        .map(|(order, (file_idx, file, parsed))| {
+            let released = (now - chrono::Duration::minutes(order as i64))
+                .to_rfc3339_opts(SecondsFormat::Millis, true);
+            let video_id = local_addon_video_id(imdb_id.as_deref(), parsed.as_ref())
+                .unwrap_or_else(|| format!("{info_hash}/{file_idx}"));
+            let thumbnail = local_addon_video_thumbnail(
+                imdb_id.as_deref(),
+                parsed.as_ref(),
+                background.as_deref(),
+            );
+
+            let mut video = Map::new();
+            video.insert("id".into(), json!(video_id));
+            video.insert("title".into(), json!(file.name));
+            video.insert("publishedAt".into(), json!(now_text));
+            video.insert("released".into(), json!(released));
+            video.insert(
+                "stream".into(),
+                json!({
+                    "infoHash": info_hash,
+                    "fileIdx": file_idx,
+                    "title": format!("{info_hash}/{file_idx}"),
+                    "sources": Value::Null
+                }),
+            );
+            video.insert("thumbnail".into(), json!(thumbnail));
+            if let Some(season) = parsed.as_ref().and_then(|parsed| parsed.season) {
+                video.insert("season".into(), json!(season));
+            }
+            if let Some(episode) = parsed.as_ref().and_then(|parsed| parsed.episode) {
+                video.insert("episode".into(), json!(episode));
+            }
+            Value::Object(video)
+        })
+        .collect::<Vec<_>>();
+
+    let mut meta = enriched.unwrap_or_else(|| {
+        json!({
+            "name": fallback_name,
+            "showAsVideos": true
+        })
+    });
+    if let Some(meta) = meta.as_object_mut() {
+        meta.insert("id".into(), json!(format!("bt:{info_hash}")));
+        meta.insert("type".into(), json!(media_type));
+        meta.insert("videos".into(), json!(videos));
+        meta.entry("name").or_insert_with(|| json!(fallback_name));
+        if !meta.contains_key("showAsVideos") && !meta.contains_key("poster") {
+            meta.insert("showAsVideos".into(), json!(true));
+        }
+    }
+
+    Ok(json!({ "meta": meta }))
+}
+
+async fn fetch_cinemeta_for_parsed(
+    client: &reqwest::Client,
+    parsed: &ParsedVideoName,
+) -> anyhow::Result<Option<Value>> {
+    let media_type = parsed.kind.as_cinemeta_type();
+    let search = utf8_percent_encode(&parsed.name, PATH_SEGMENT_ENCODE_SET).to_string();
+    let url = format!("{CINEMETA_BASE_URL}/catalog/{media_type}/top/search={search}.json");
+    let catalog = timeout(Duration::from_secs(6), client.get(url).send())
+        .await
+        .context("cinemeta search timed out")??
+        .error_for_status()
+        .context("cinemeta search returned error")?
+        .json::<Value>()
+        .await
+        .context("decoding cinemeta search")?;
+
+    let Some(imdb_id) = pick_cinemeta_search_result(&catalog, parsed) else {
+        return Ok(None);
+    };
+
+    let url = format!("{CINEMETA_BASE_URL}/meta/{media_type}/{imdb_id}.json");
+    let full = timeout(Duration::from_secs(6), client.get(url).send())
+        .await
+        .context("cinemeta meta timed out")??
+        .error_for_status()
+        .context("cinemeta meta returned error")?
+        .json::<Value>()
+        .await
+        .context("decoding cinemeta meta")?;
+
+    let Some(meta) = full.get("meta").and_then(Value::as_object) else {
+        return Ok(None);
+    };
+
+    let mut out = Map::new();
+    for key in CINEMETA_META_FIELDS {
+        if let Some(value) = meta.get(*key) {
+            out.insert((*key).to_owned(), value.clone());
+        }
+    }
+
+    let imdb_id = meta
+        .get("imdb_id")
+        .or_else(|| meta.get("id"))
+        .and_then(Value::as_str)
+        .unwrap_or(&imdb_id);
+    out.entry("poster")
+        .or_insert_with(|| json!(format!("{METAHUB_BASE_URL}/poster/medium/{imdb_id}/img")));
+    out.entry("background").or_insert_with(|| {
+        json!(format!(
+            "{METAHUB_BASE_URL}/background/medium/{imdb_id}/img"
+        ))
+    });
+    out.entry("logo")
+        .or_insert_with(|| json!(format!("{METAHUB_BASE_URL}/logo/medium/{imdb_id}/img")));
+
+    Ok(Some(Value::Object(out)))
+}
+
+fn pick_cinemeta_search_result(catalog: &Value, parsed: &ParsedVideoName) -> Option<String> {
+    let metas = catalog.get("metas")?.as_array()?;
+    let simplified_query = simplify_video_title(&parsed.name);
+    metas
+        .iter()
+        .filter_map(|meta| {
+            let imdb_id = meta
+                .get("imdb_id")
+                .or_else(|| meta.get("id"))
+                .and_then(Value::as_str)?;
+            let name = meta.get("name").and_then(Value::as_str).unwrap_or_default();
+            let simplified_name = simplify_video_title(name);
+            let name_score = if simplified_name == simplified_query {
+                100
+            } else if simplified_name.contains(&simplified_query)
+                || simplified_query.contains(&simplified_name)
+            {
+                65
+            } else {
+                0
+            };
+            if name_score == 0 {
+                return None;
+            }
+
+            let result_year = meta
+                .get("releaseInfo")
+                .or_else(|| meta.get("year"))
+                .and_then(Value::as_str)
+                .and_then(|value| value.get(..4))
+                .and_then(|value| value.parse::<i32>().ok());
+            let year_score = match (parsed.year, result_year) {
+                (Some(expected), Some(actual)) if expected == actual => 50,
+                (Some(expected), Some(actual)) if (expected - actual).abs() <= 1 => 20,
+                (Some(_), Some(_)) => -50,
+                (Some(_), None) => -10,
+                _ => 0,
+            };
+
+            Some((name_score + year_score, imdb_id.to_owned()))
+        })
+        .max_by_key(|(score, _)| *score)
+        .map(|(_, imdb_id)| imdb_id)
+}
+
+fn local_addon_video_id(imdb_id: Option<&str>, parsed: Option<&ParsedVideoName>) -> Option<String> {
+    let imdb_id = imdb_id?;
+    let parsed = parsed?;
+    Some(
+        [
+            Some(imdb_id.to_owned()),
+            parsed.season.map(|value| value.to_string()),
+            parsed.episode.map(|value| value.to_string()),
+        ]
+        .into_iter()
+        .flatten()
+        .collect::<Vec<_>>()
+        .join(":"),
+    )
+}
+
+fn local_addon_video_thumbnail(
+    imdb_id: Option<&str>,
+    parsed: Option<&ParsedVideoName>,
+    background: Option<&str>,
+) -> Option<String> {
+    let imdb_id = imdb_id?;
+    match parsed.and_then(|parsed| parsed.season.zip(parsed.episode)) {
+        Some((season, episode)) => Some(format!(
+            "{METAHUB_EPISODES_URL}/{imdb_id}/{season}/{episode}/w780.jpg"
+        )),
+        None => background.map(str::to_owned),
+    }
+}
+
+fn parse_video_filename(name: &str) -> Option<ParsedVideoName> {
+    let stem = Path::new(name)
+        .file_stem()
+        .and_then(|stem| stem.to_str())
+        .unwrap_or(name);
+    let normalized = stem.replace(['.', '_', '-'], " ");
+
+    let season_episode = RegexBuilder::new(r"(?i)\bS(\d{1,2})\s*E(\d{1,3})\b")
+        .build()
+        .ok()
+        .and_then(|re| {
+            re.captures(&normalized).and_then(|captures| {
+                let whole = captures.get(0)?;
+                let season = captures.get(1)?.as_str().parse::<u32>().ok()?;
+                let episode = captures.get(2)?.as_str().parse::<u32>().ok()?;
+                Some((whole.start(), season, episode))
+            })
+        });
+
+    let year_match = RegexBuilder::new(r"\b(19\d{2}|20\d{2})\b")
+        .build()
+        .ok()
+        .and_then(|re| {
+            re.find(&normalized)
+                .and_then(|m| m.as_str().parse::<i32>().ok().map(|year| (m.start(), year)))
+        });
+
+    let cutoff = season_episode
+        .map(|(idx, _, _)| idx)
+        .or_else(|| year_match.map(|(idx, _)| idx))
+        .unwrap_or_else(|| normalized.len());
+    let parsed_name = cleanup_video_title(&normalized[..cutoff]);
+    if parsed_name.is_empty() {
+        return None;
+    }
+
+    Some(ParsedVideoName {
+        name: parsed_name,
+        year: year_match.map(|(_, year)| year),
+        season: season_episode.map(|(_, season, _)| season),
+        episode: season_episode.map(|(_, _, episode)| episode),
+        kind: if season_episode.is_some() {
+            ParsedVideoKind::Series
+        } else {
+            ParsedVideoKind::Movie
+        },
+    })
+}
+
+fn cleanup_video_title(value: &str) -> String {
+    value
+        .split_whitespace()
+        .filter(|part| {
+            let lower = part.to_ascii_lowercase();
+            !matches!(
+                lower.as_str(),
+                "1080p"
+                    | "720p"
+                    | "2160p"
+                    | "480p"
+                    | "webrip"
+                    | "web"
+                    | "webdl"
+                    | "web-dl"
+                    | "bluray"
+                    | "brrip"
+                    | "hdrip"
+                    | "hdtv"
+                    | "x264"
+                    | "x265"
+                    | "h264"
+                    | "h265"
+                    | "hevc"
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(" ")
+        .trim()
+        .to_owned()
+}
+
+fn simplify_video_title(value: &str) -> String {
+    value
+        .chars()
+        .flat_map(char::to_lowercase)
+        .filter(|ch| ch.is_ascii_alphanumeric())
+        .collect()
+}
+
 async fn root(State(state): State<AppState>) -> Response {
     let base_url = state.base_url.read().await.clone();
     let app_url = format!(
@@ -970,37 +1363,65 @@ async fn device_info(State(state): State<AppState>) -> Json<Value> {
 
 async fn local_addon_manifest() -> Json<Value> {
     Json(json!({
-        "id": "org.stremio.local-addon",
-        "version": "0.0.1",
+        "id": "org.stremio.local",
+        "version": env!("CARGO_PKG_VERSION"),
         "name": "Local Files",
-        "description": "Local addon compatibility stub",
-        "resources": ["catalog", "meta", "stream", "subtitles"],
-        "types": ["movie", "series", "other", "channel"],
-        "idPrefixes": ["tt", "local", "file"]
+        "description": "Local add-on to find playable files: .torrent, .mp4, .mkv and .avi",
+        "resources": [
+            "catalog",
+            {
+                "name": "meta",
+                "types": ["other"],
+                "idPrefixes": ["local:", "bt:"]
+            },
+            {
+                "name": "stream",
+                "types": ["movie", "series"],
+                "idPrefixes": ["tt"]
+            }
+        ],
+        "types": ["movie", "series", "other"],
+        "catalogs": [
+            {
+                "type": "other",
+                "id": "local"
+            }
+        ]
     }))
 }
 
-async fn local_addon_dispatch(AxumPath(rest): AxumPath<String>) -> Json<Value> {
+async fn local_addon_dispatch(
+    State(state): State<AppState>,
+    AxumPath(rest): AxumPath<String>,
+) -> AppResult<Json<Value>> {
     let rest = rest.trim_start_matches('/');
     let mut parts = rest.split('/').collect::<Vec<_>>();
 
     if parts.len() < 3 {
-        return Json(json!({ "err": "handler error" }));
+        return Ok(Json(json!({ "err": "handler error" })));
     }
 
     let resource = parts.remove(0);
     let media_type = parts.remove(0);
     let id = parts.remove(0);
+    let id = id.strip_suffix(".json").unwrap_or(id);
+    let decoded_id = id.replace("%3A", ":").replace("%3a", ":");
 
     let extra = parts.join("/");
     let extra = extra.strip_suffix(".json").unwrap_or(&extra);
 
-    Json(local_addon_resource_payload(
+    if resource == "meta" && media_type == "other" && decoded_id.starts_with("bt:") {
+        return local_addon_bt_meta(&state, media_type, &decoded_id)
+            .await
+            .map(Json);
+    }
+
+    Ok(Json(local_addon_resource_payload(
         resource,
         media_type,
-        id,
+        &decoded_id,
         if extra.is_empty() { None } else { Some(extra) },
-    ))
+    )))
 }
 
 async fn hwaccel_profiler(State(state): State<AppState>) -> Json<Value> {
@@ -2503,6 +2924,14 @@ fn is_video_like(name: &str) -> bool {
         ext.to_ascii_lowercase().as_str(),
         "mkv" | "mp4" | "avi" | "mov" | "m4v" | "webm" | "ts" | "m2ts" | "wmv"
     )
+}
+
+fn display_name_from_filename(name: &str) -> String {
+    let stem = Path::new(name)
+        .file_stem()
+        .and_then(|stem| stem.to_str())
+        .unwrap_or(name);
+    stem.replace(['.', '_'], " ")
 }
 
 fn parse_json_body<T>(body: &Bytes) -> AppResult<T>

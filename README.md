@@ -128,7 +128,7 @@ Legend: ✅ Done · ⚠️ Stub (route exists, returns empty/null) · ❌ TODO
 - ❌ `ALL /casting/:devID/player`
 
 ### Everything Else
-- ❌ `ALL /proxy/:opts/:pathname*`
+- ✅ `ALL /proxy/:opts/:pathname*` — HTTP proxy with redirect handling and playlist URL rewriting
 - ❌ `GET /yt/:id.json` / `GET /yt/:id`
 - ❌ `GET /samples/:key.:container`
 - ❌ Archive routes: `/rar`, `/zip`, `/7zip`, `/tar`, `/tgz`
@@ -143,7 +143,6 @@ Legend: ✅ Done · ⚠️ Stub (route exists, returns empty/null) · ❌ TODO
 
 - [ ] Add conformance tests with captured desktop traffic for create/stats/stream/local-addon flows
 - [ ] Harden local-addon filename parsing and Cinemeta matching for common movie/series release names
-- [ ] `ALL /proxy/:opts/:pathname*` — HTTP proxy with playlist URL rewriting for direct URL edge cases
 
 ### P1 (desktop polish / compatibility)
 
@@ -163,7 +162,6 @@ Legend: ✅ Done · ⚠️ Stub (route exists, returns empty/null) · ❌ TODO
 - [ ] `GET /hlsv2/:id/destroy` — tear down converter session
 - [ ] HLSv2 compat routes — `/:infoHash/:videoId/:playlist` rewrite into hlsv2 router
 - [ ] Legacy HLS routes — `hls.m3u8`, `stream.m3u8`, `stream-q-*.m3u8`, `.ts` segments, `dlna`, `subs-*.m3u8`, `thumb.jpg`
-- [ ] `ALL /proxy/:opts/:pathname*` — HTTP proxy with playlist URL rewriting
 - [ ] `GET /casting` — real device discovery (Chromecast etc.)
 - [ ] `GET /casting/transcode` / `GET /casting/convert` — ffmpeg transcode stream for casting
 - [ ] `GET /casting/:devID` — device detail
@@ -913,7 +911,7 @@ Response:
 
 Mounted at `/proxy`.
 
-### `ALL /proxy/:opts/:pathname(*)?` ❌
+### `ALL /proxy/:opts/:pathname(*)?` ✅
 
 Inputs:
 
@@ -954,6 +952,7 @@ Response headers copied back:
 Behavior:
 
 - Follows up to 5 redirects.
+- Uses a proxy-specific HTTP client with automatic redirects disabled and invalid TLS certificates/hostnames accepted, matching the legacy proxy behavior.
 - For `.m3u`, `.m3u8`, or MPEGURL content, removes `content-length`, sets
   `accept-ranges: none`, ensures chunked transfer, and rewrites playlist URLs through `/proxy`.
 

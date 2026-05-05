@@ -13,7 +13,7 @@ This project reverse-engineers that contract and reimplements the server in Rust
 being a drop-in replacement: the desktop shell launches this binary instead of the bundled
 Node.js `server.js` runtime and never knows the difference.
 
-The torrent engine is powered by [librqbit](https://github.com/ikatson/rqbit) rather than the
+The torrent engine is powered by [librqbit](https://github.com/Loukious/rqbit) rather than the
 original Node.js torrent-stream.
 
 ## Why

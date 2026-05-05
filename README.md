@@ -87,9 +87,9 @@ Legend: ✅ Done · ⚠️ Stub (route exists, returns empty/null) · ❌ TODO
 - ✅ Multi-file torrents select only the requested/guessed video file when possible
 
 ### Subtitle Routes
-- ✅ `GET /subtitles.{ext}` — full proxy with SRT→VTT conversion; `offset=` param not implemented
+- ✅ `GET /subtitles.{ext}` — full proxy with SRT/VTT parsing, SRT→VTT conversion, and `offset=<ms>`
 - ⚠️ `GET /opensubHash` — returns `{ error: null, result: null }`; hash not computed
-- ⚠️ `GET /subtitlesTracks` — returns empty tracks; `subsUrl` not fetched or parsed
+- ✅ `GET /subtitlesTracks` — fetches `subsUrl` and returns parsed cue tracks
 - ❌ `GET /tracks/:url`
 
 ### Probe / HLS
@@ -140,9 +140,7 @@ Legend: ✅ Done · ⚠️ Stub (route exists, returns empty/null) · ❌ TODO
 
 - [ ] Add conformance tests with captured desktop traffic for create/stats/stream/local-addon flows
 - [ ] Harden local-addon filename parsing and Cinemeta matching for common movie/series release names
-- [ ] `GET /subtitles.{ext}` — implement `offset=<ms>` timestamp shifting
 - [ ] `GET /opensubHash` — compute actual OpenSubtitles hash from `videoUrl=`
-- [ ] `GET /subtitlesTracks` — fetch `subsUrl`, parse and return timestamped tracks
 - [ ] `ALL /proxy/:opts/:pathname*` — HTTP proxy with playlist URL rewriting for direct URL edge cases
 
 ### P1 (desktop polish / compatibility)
@@ -718,7 +716,7 @@ Response:
 
 ## Subtitle Routes
 
-### `GET /subtitlesTracks` ⚠️
+### `GET /subtitlesTracks` ✅
 
 Inputs:
 
@@ -743,7 +741,7 @@ Response:
 }
 ```
 
-Currently returns empty tracks regardless of `subsUrl`. Fetching and parsing `subsUrl` not yet implemented.
+Fetches `subsUrl`, parses SRT/VTT cues, and returns timestamped tracks.
 
 ### `GET /opensubHash` ⚠️
 
@@ -773,7 +771,7 @@ Inputs:
 
 - `ext`: `vtt` or `srt`.
 - Query `from=<subtitle-url>`, required.
-- Query `offset=<milliseconds>`, optional. ⚠️ Offset shifting not yet implemented.
+- Query `offset=<milliseconds>`, optional.
 
 Response:
 

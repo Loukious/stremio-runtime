@@ -1,4 +1,4 @@
-# stremio-service-rs
+# stremio-runtime
 
 A Rust reimplementation of the Stremio Service, reverse-engineered from the
 original server.js and the mobile app.
@@ -10,8 +10,8 @@ torrent streaming, subtitle proxying, HLS transcoding, and other media duties. T
 over `localhost:11470` and expects a specific JSON/streaming HTTP contract.
 
 This project reverse-engineers that contract and reimplements the server in Rust, with the goal of
-being a drop-in replacement: the desktop shell launches this binary instead of `stremio-runtime.exe
-server.js` and never knows the difference.
+being a drop-in replacement: the desktop shell launches this binary instead of the bundled
+Node.js `server.js` runtime and never knows the difference.
 
 The torrent engine is powered by [librqbit](https://github.com/ikatson/rqbit) rather than the
 original Node.js torrent-stream.
@@ -38,10 +38,9 @@ See the endpoint map below for a full breakdown of what is and isn't implemented
 
 ## Replacing the official server
 
-This is meant to be used with my [Stremio fork](https://github.com/Loukious/stremio-shell-ng).
-but can very well be used with the original shell as well. To use it, build this project in
-release mode (or just download the binaries from the github releases) and rename stremio-service-rs.exe
-to stremio-runtime.exe. Then replace the original.
+This is meant to be used with my [Stremio fork](https://github.com/Loukious/stremio-shell-ng),
+but can also be used with the original shell. To use it, build this project in release mode
+or download a release binary, name it `stremio-runtime.exe`, and replace the original runtime.
 
 ---
 
@@ -66,6 +65,8 @@ Legend: ✅ Done · ⚠️ Stub (route exists, returns empty/null) · ❌ TODO
 - ✅ Binds to `127.0.0.1:11470`, increments up to `11474` on conflict
 - ✅ Prints `EngineFS server started at http://127.0.0.1:<port>` on stdout
 - ✅ CORS — all origins, `GET/POST/HEAD/OPTIONS`, `max-age=1728000`
+- ✅ Reads/writes Stremio `server-settings.json`
+- ✅ Cache reaper honors `cacheSize` and removes inactive cache entries periodically and at startup
 - ❌ HTTPS endpoint on port `12470`
 
 ### Core Torrent Routes
@@ -82,6 +83,8 @@ Legend: ✅ Done · ⚠️ Stub (route exists, returns empty/null) · ❌ TODO
 - ✅ `GET /{infoHash}/{idx}/stats.json`
 - ✅ `GET /{infoHash}/{idx}` — range, HEAD, `external=1`, `download=1`, `subtitles=`, `tr=`, `f=`
 - ✅ `GET /{infoHash}/{idx}/{*filename}` — filename-style stream URL
+- ✅ Streams requested byte ranges while downloading; seek requests reprioritize the active window
+- ✅ Multi-file torrents select only the requested/guessed video file when possible
 
 ### Subtitle Routes
 - ✅ `GET /subtitles.{ext}` — full proxy with SRT→VTT conversion; `offset=` param not implemented
@@ -110,7 +113,10 @@ Legend: ✅ Done · ⚠️ Stub (route exists, returns empty/null) · ❌ TODO
 
 ### Local Addon
 - ✅ `GET /local-addon/manifest.json`
-- ⚠️ `GET /local-addon/{*rest}` — stub dispatcher returning empty results
+- ✅ `GET /local-addon/meta/other/bt:<infoHash>.json` — creates/loads magnet metadata, returns playable videos
+- ✅ Best-effort Cinemeta/Metahub enrichment for local `bt:` metadata
+- ⚠️ `GET /local-addon/catalog/other/local.json` — returns an empty local catalog; filesystem indexing not implemented
+- ⚠️ Other local-addon resources return empty/null compatibility payloads
 
 ### Casting
 - ⚠️ `GET /casting` — returns a static VLC entry; no real device discovery
@@ -132,12 +138,22 @@ Legend: ✅ Done · ⚠️ Stub (route exists, returns empty/null) · ❌ TODO
 
 ### P0 gaps (affect current desktop playback)
 
+- [ ] Add conformance tests with captured desktop traffic for create/stats/stream/local-addon flows
+- [ ] Harden local-addon filename parsing and Cinemeta matching for common movie/series release names
 - [ ] `GET /subtitles.{ext}` — implement `offset=<ms>` timestamp shifting
 - [ ] `GET /opensubHash` — compute actual OpenSubtitles hash from `videoUrl=`
+- [ ] `GET /subtitlesTracks` — fetch `subsUrl`, parse and return timestamped tracks
+- [ ] `ALL /proxy/:opts/:pathname*` — HTTP proxy with playlist URL rewriting for direct URL edge cases
 
-### P1 (casting, proxying, HLS for non-desktop clients)
+### P1 (desktop polish / compatibility)
 
 - [ ] `GET /probe` — invoke ffprobe, return legacy probe model
+- [ ] `GET /tracks/:url` — media track metadata endpoint
+- [ ] Better `/settings` parity for every desktop option value the shell may read
+- [ ] More exact `EngineStats` parity for selections, wires, and source counters
+
+### P2 (casting, HLS, transcoding, and non-desktop clients)
+
 - [ ] `GET /hlsv2/probe` — invoke ffprobe, return HLSv2 format+streams+samples model
 - [ ] `GET /hlsv2/:id/:track.m3u8` — fMP4 HLS playlist generation
 - [ ] `GET /hlsv2/:id/:track/init.mp4` — fMP4 init segment
@@ -152,10 +168,8 @@ Legend: ✅ Done · ⚠️ Stub (route exists, returns empty/null) · ❌ TODO
 - [ ] `GET /casting/transcode` / `GET /casting/convert` — ffmpeg transcode stream for casting
 - [ ] `GET /casting/:devID` — device detail
 - [ ] `ALL /casting/:devID/player` — cast player control
-- [ ] `GET /subtitlesTracks` — fetch `subsUrl`, parse and return timestamped tracks
-- [ ] `GET /tracks/:url` — media track metadata endpoint
 
-### P2 (archive sources, YouTube, HTTPS, samples)
+### P3 (archive sources, YouTube, HTTPS, samples)
 
 - [ ] `GET /` + HTTPS endpoint on port 12470 + `GET /get-https` returning real cert info
 - [ ] `/rar/*`, `/zip/*`, `/7zip/*`, `/tar/*`, `/tgz/*` — archive create/stream routes

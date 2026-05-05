@@ -918,6 +918,12 @@ async fn local_addon_bt_meta(state: &AppState, media_type: &str, id: &str) -> Ap
         return Ok(json!({ "meta": null }));
     }
 
+    if let Some((file_idx, _)) = video_files.iter().max_by_key(|(_, file)| file.length) {
+        if let Err(err) = state.torrents.select_only_file(&handle, *file_idx).await {
+            debug!(info_hash, file_idx, error = %err.0, "local-addon default file selection failed");
+        }
+    }
+
     let now = Utc::now();
     let now_text = now.to_rfc3339_opts(SecondsFormat::Millis, true);
     let parsed_files = video_files
@@ -1580,6 +1586,7 @@ async fn global_stats(State(state): State<AppState>) -> Json<Value> {
     let handles = state.torrents.handles.read().await;
     let mut out = Map::new();
     for (hash, handle) in handles.iter() {
+        state.torrents.touch(hash).await;
         out.insert(
             hash.clone(),
             stats_for_handle(handle, &state.torrents.cache_dir, None, None),
@@ -1650,13 +1657,16 @@ async fn torrent_stats(
     State(state): State<AppState>,
     AxumPath(InfoHashPath { info_hash }): AxumPath<InfoHashPath>,
 ) -> Json<Option<Value>> {
-    Json(
-        state
-            .torrents
-            .get(&info_hash)
-            .await
-            .map(|handle| stats_for_handle(&handle, &state.torrents.cache_dir, None, None)),
-    )
+    let Some(handle) = state.torrents.get(&info_hash).await else {
+        return Json(None);
+    };
+    state.torrents.touch(&handle.info_hash().as_string()).await;
+    Json(Some(stats_for_handle(
+        &handle,
+        &state.torrents.cache_dir,
+        None,
+        None,
+    )))
 }
 
 async fn torrent_file_stats(
@@ -1666,6 +1676,7 @@ async fn torrent_file_stats(
     let Some(handle) = state.torrents.get(&info_hash).await else {
         return Json(None);
     };
+    state.torrents.touch(&handle.info_hash().as_string()).await;
 
     // Stats consumers expect per-file stats to include stream* fields.
     // If metadata isn't ready or we can't resolve the file index, return null (matches official server behavior).
@@ -2057,6 +2068,7 @@ impl TorrentService {
     ) -> AppResult<Arc<librqbit::ManagedTorrent>> {
         let info_hash = normalize_info_hash(info_hash)?;
         if let Some(handle) = self.get(&info_hash).await {
+            self.touch(&info_hash).await;
             return Ok(handle);
         }
 

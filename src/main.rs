@@ -27,7 +27,8 @@ use axum::{
 use chrono::{SecondsFormat, Utc};
 use futures_util::stream::Stream;
 use librqbit::{
-    AddTorrent, AddTorrentOptions, Magnet, PeerConnectionOptions, Session, SessionOptions,
+    AddTorrent, AddTorrentOptions, ConnectionOptions, ListenerOptions, Magnet,
+    PeerConnectionOptions, Session, SessionOptions,
     api::TorrentIdOrHash,
 };
 use percent_encoding::{AsciiSet, CONTROLS, utf8_percent_encode};
@@ -48,10 +49,30 @@ use url::form_urlencoded;
 
 const DEFAULT_HTTP_PORT: u16 = 11470;
 const STARTUP_NAME: &str = "stremio-service-rs";
-const STREAM_INIT_TIMEOUT: Duration = Duration::from_secs(60);
+// How long to wait for torrent metadata (DHT + extension protocol handshake).
+// Must be shorter than mpv/yt-dlp's 20 s read timeout so we can return a
+// proper 503 error before the client gives up and marks the whole URL broken.
+const STREAM_INIT_TIMEOUT: Duration = Duration::from_secs(14);
+// How long to wait for stream() to open and seek() to complete.
+// Both operations can block a tokio OS thread if pieces aren't on disk yet;
+// we time them out separately so the runtime stays responsive.
+const STREAM_OPEN_TIMEOUT: Duration = Duration::from_secs(10);
 const CREATE_METADATA_GRACE: Duration = Duration::from_millis(1500);
 const ENGINE_INACTIVITY_TIMEOUT: Duration = Duration::from_secs(2 * 60);
 const ENGINE_CLEANUP_INTERVAL: Duration = Duration::from_secs(10);
+
+// ── Streaming window tuning ───────────────────────────────────────────────────
+// How far ahead of the read cursor the download scheduler should prioritise.
+const STREAM_WINDOW_FORWARD: u64 = 32 * 1024 * 1024; // 32 MB
+// How far behind the cursor to keep in the priority window (handles small
+// re-reads and codec look-behind).
+const STREAM_WINDOW_BACKWARD: u64 = 4 * 1024 * 1024; // 4 MB
+// When the read cursor is within this distance of the end of file we extend the
+// backward window so the player's internal buffer can re-read freely.
+const STREAM_WINDOW_EOF_ZONE: u64 = 64 * 1024 * 1024; // last 64 MB of file
+const STREAM_WINDOW_EOF_BACKWARD: u64 = 32 * 1024 * 1024; // 32 MB backward near EOF
+// Slide the window every time this many additional bytes have been read.
+const STREAM_WINDOW_UPDATE_EVERY: u64 = 4 * 1024 * 1024; // every 4 MB
 
 const PATH_SEGMENT_ENCODE_SET: &AsciiSet = &CONTROLS
     .add(b' ')
@@ -172,12 +193,25 @@ impl SettingsStore {
 
 type BoxByteStream = Pin<Box<dyn Stream<Item = Result<Bytes, std::io::Error>> + Send>>;
 
-struct DropNotifyStream {
+/// Wraps the byte stream to:
+///   1. Slide the librqbit download-priority window forward as bytes are read, so
+///      the scheduler always knows where the player actually is.
+///   2. Widen the backward window when the player is near the end of the file,
+///      preventing re-fetches of content the player's own buffer may re-read.
+///   3. Run an on-drop callback (to decrement the active-stream counter).
+struct WindowTrackingStream {
     inner: BoxByteStream,
     on_drop: Option<Box<dyn FnOnce() + Send + 'static>>,
+    handle: Arc<librqbit::ManagedTorrent>,
+    file_idx: usize,
+    file_len: u64,
+    /// Absolute byte offset into the file where the current read cursor sits.
+    position: u64,
+    /// Value of `position` the last time we pushed a window update.
+    last_update_at: u64,
 }
 
-impl Drop for DropNotifyStream {
+impl Drop for WindowTrackingStream {
     fn drop(&mut self) {
         if let Some(cb) = self.on_drop.take() {
             cb();
@@ -185,12 +219,40 @@ impl Drop for DropNotifyStream {
     }
 }
 
-impl Stream for DropNotifyStream {
+impl Stream for WindowTrackingStream {
     type Item = Result<Bytes, std::io::Error>;
 
     fn poll_next(self: Pin<&mut Self>, cx: &mut TaskContext<'_>) -> Poll<Option<Self::Item>> {
         let this = self.get_mut();
-        this.inner.as_mut().poll_next(cx)
+        let poll = this.inner.as_mut().poll_next(cx);
+
+        if let Poll::Ready(Some(Ok(ref bytes))) = poll {
+            this.position += bytes.len() as u64;
+
+            let bytes_since_update = this.position.saturating_sub(this.last_update_at);
+            if bytes_since_update >= STREAM_WINDOW_UPDATE_EVERY {
+                this.last_update_at = this.position;
+
+                // Near the end of the file the player's internal buffer may
+                // re-read content we have already served.  Widen the backward
+                // window so those reads hit the disk cache, not the network.
+                let near_eof = this.file_len.saturating_sub(this.position) < STREAM_WINDOW_EOF_ZONE;
+                let backward = if near_eof {
+                    STREAM_WINDOW_EOF_BACKWARD
+                } else {
+                    STREAM_WINDOW_BACKWARD
+                };
+
+                let _ = this.handle.update_streaming_window(
+                    this.file_idx,
+                    this.position,
+                    backward,
+                    STREAM_WINDOW_FORWARD,
+                );
+            }
+        }
+
+        poll
     }
 }
 
@@ -366,18 +428,30 @@ async fn main() -> anyhow::Result<()> {
         .with_context(|| format!("creating cache dir {}", cache_dir.display()))?;
 
     let trackers = default_tracker_urls();
+
     let session = Session::new_with_opts(
         cache_dir.clone(),
         SessionOptions {
-            peer_opts: Some(PeerConnectionOptions {
-                connect_timeout: Some(Duration::from_secs(8)),
-                read_write_timeout: Some(Duration::from_secs(30)),
-                keep_alive_interval: Some(Duration::from_secs(60)),
+            listen: Some(ListenerOptions {
+                listen_addr: (Ipv4Addr::UNSPECIFIED, 0).into(),
+                enable_upnp_port_forwarding: true,
+                ..Default::default()
             }),
-            listen_port_range: Some(48000..48100),
-            enable_upnp_port_forwarding: true,
+            connect: Some(ConnectionOptions {
+                peer_opts: Some(PeerConnectionOptions {
+                    connect_timeout: Some(Duration::from_secs(8)),
+                    read_write_timeout: Some(Duration::from_secs(30)),
+                    keep_alive_interval: Some(Duration::from_secs(60)),
+                }),
+                ..Default::default()
+            }),
+            // fastresume_folder saves only the have-piece bitfield, not the
+            // torrent list.  On restart the session does a fast spot-check
+            // instead of a full SHA-1 pass, without auto-resuming any torrent.
             fastresume: true,
-            concurrent_init_limit: Some(16),
+            fastresume_folder: Some(cache_dir.join("session")),
+            // Lowered from 16: each init SHA-1s in a blocking thread-pool slot.
+            concurrent_init_limit: Some(4),
             trackers,
             ..Default::default()
         },
@@ -1067,9 +1141,6 @@ async fn create_magnet(
         request.guess_file_idx.as_ref(),
         request.file_idx,
     );
-    if let Some(file_idx) = guessed {
-        state.torrents.select_only_file(&handle, file_idx).await?;
-    }
     Ok(Json(stats_for_handle(
         &handle,
         &state.torrents.cache_dir,
@@ -1189,6 +1260,7 @@ async fn stream_common(
     raw_query: Option<String>,
     headers: HeaderMap,
 ) -> AppResult<Response> {
+    let t0 = std::time::Instant::now();
     let query = parse_stream_query(raw_query.as_deref());
     let normalized_info_hash = match normalize_info_hash(&info_hash) {
         Ok(hash) => hash,
@@ -1198,20 +1270,66 @@ async fn stream_common(
         }
     };
 
+    let range_header = headers
+        .get(RANGE)
+        .and_then(|h| h.to_str().ok())
+        .unwrap_or("none")
+        .to_owned();
+
+    info!(
+        info_hash,
+        idx,
+        range = %range_header,
+        "[TIMING] request received",
+    );
+
     let initial_file_idx = idx.parse::<isize>().ok().and_then(valid_idx);
+    state.torrents.stop_others(&normalized_info_hash);
+
     let handle = state
         .torrents
         .get_or_add_magnet(&normalized_info_hash, query.trackers.clone(), initial_file_idx)
         .await?;
 
-    timeout(STREAM_INIT_TIMEOUT, handle.wait_until_initialized())
-        .await
-        .context("timed out waiting for torrent metadata")?
-        .context("torrent initialization failed")?;
+    info!(info_hash, elapsed_ms = t0.elapsed().as_millis(), "[TIMING] torrent handle acquired");
+
+    // ── Wait for metadata / initial check ─────────────────────────────────────
+    match timeout(STREAM_INIT_TIMEOUT, handle.wait_until_initialized()).await {
+        Ok(Ok(())) => {}
+        Ok(Err(err)) => {
+            warn!(info_hash, "[TIMING] torrent initialization failed after {}ms: {err:#}", t0.elapsed().as_millis());
+            return Ok((
+                StatusCode::SERVICE_UNAVAILABLE,
+                [("Retry-After", "5")],
+                "torrent initialization failed",
+            )
+                .into_response());
+        }
+        Err(_elapsed) => {
+            warn!(info_hash, "[TIMING] timed out waiting for torrent metadata after {}ms", t0.elapsed().as_millis());
+            return Ok((
+                StatusCode::SERVICE_UNAVAILABLE,
+                [("Retry-After", "5")],
+                "waiting for torrent metadata",
+            )
+                .into_response());
+        }
+    }
+
+    info!(info_hash, elapsed_ms = t0.elapsed().as_millis(), "[TIMING] wait_until_initialized done");
 
     let file_idx = resolve_file_index(&handle, &idx, &query.filters)?;
     let file = file_for_handle(&handle, file_idx)?.context("torrent file not found")?;
-    state.torrents.select_only_file(&handle, file_idx).await?;
+
+    {
+        let torrents = state.torrents.clone();
+        let handle2 = handle.clone();
+        tokio::spawn(async move {
+            if let Err(e) = torrents.select_only_file(&handle2, file_idx).await {
+                warn!(file_idx, "select_only_file failed (non-fatal): {:?}", e.0);
+            }
+        });
+    }
 
     if query.external {
         let location = format!(
@@ -1224,10 +1342,7 @@ async fn stream_common(
         return Ok(redirect(StatusCode::TEMPORARY_REDIRECT, &location));
     }
 
-    let mut stream = handle
-        .stream(file_idx)
-        .context("opening torrent file stream")?;
-    let total_len = stream.len();
+    let total_len = file.length;
     let range = headers
         .get(RANGE)
         .and_then(|header| header.to_str().ok())
@@ -1238,11 +1353,81 @@ async fn stream_common(
         None => (StatusCode::OK, 0, total_len.saturating_sub(1)),
     };
 
+    info!(
+        info_hash,
+        elapsed_ms = t0.elapsed().as_millis(),
+        start,
+        total_len,
+        "[TIMING] range parsed, setting streaming window",
+    );
+
+    let initial_near_eof =
+        total_len > 0 && total_len.saturating_sub(start) < STREAM_WINDOW_EOF_ZONE;
+    let initial_backward = if initial_near_eof {
+        STREAM_WINDOW_EOF_BACKWARD
+    } else {
+        STREAM_WINDOW_BACKWARD
+    };
+
+    let _ = handle.update_streaming_window(
+        file_idx,
+        start,
+        initial_backward,
+        STREAM_WINDOW_FORWARD,
+    );
+
+    info!(info_hash, elapsed_ms = t0.elapsed().as_millis(), "[TIMING] calling stream()");
+
+    let mut stream = match timeout(STREAM_OPEN_TIMEOUT, handle.clone().stream(file_idx)).await {
+        Ok(Ok(s)) => {
+            info!(info_hash, elapsed_ms = t0.elapsed().as_millis(), "[TIMING] stream() opened");
+            s
+        }
+        Ok(Err(err)) => {
+            warn!(info_hash, file_idx, elapsed_ms = t0.elapsed().as_millis(), "[TIMING] stream() failed: {err:#}");
+            return Ok((
+                StatusCode::SERVICE_UNAVAILABLE,
+                [("Retry-After", "2")],
+                "opening torrent stream failed",
+            )
+                .into_response());
+        }
+        Err(_elapsed) => {
+            warn!(info_hash, file_idx, start, elapsed_ms = t0.elapsed().as_millis(), "[TIMING] stream() timed out — pieces not yet available");
+            return Ok((
+                StatusCode::SERVICE_UNAVAILABLE,
+                [("Retry-After", "3")],
+                "waiting for torrent pieces",
+            )
+                .into_response());
+        }
+    };
+
     if start > 0 {
-        stream
-            .seek(SeekFrom::Start(start))
-            .await
-            .context("seeking torrent file stream")?;
+        info!(info_hash, start, elapsed_ms = t0.elapsed().as_millis(), "[TIMING] calling seek()");
+        match timeout(STREAM_OPEN_TIMEOUT, stream.seek(SeekFrom::Start(start))).await {
+            Ok(Ok(_)) => {
+                info!(info_hash, start, elapsed_ms = t0.elapsed().as_millis(), "[TIMING] seek() done");
+            }
+            Ok(Err(err)) => {
+                warn!(info_hash, file_idx, start, elapsed_ms = t0.elapsed().as_millis(), "[TIMING] seek() failed: {err:#}");
+                return Ok((
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    [("Retry-After", "2")],
+                    "torrent stream seek failed",
+                )
+                    .into_response());
+            }
+            Err(_elapsed) => {
+                warn!(info_hash, file_idx, start, elapsed_ms = t0.elapsed().as_millis(), "[TIMING] seek() timed out — pieces at offset not available");
+                return Ok((
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    [("Retry-After", "5")],
+                    "waiting for pieces at seek offset",
+                )
+                    .into_response());
+            }
+        }
     }
 
     let body_len = if total_len == 0 { 0 } else { end - start + 1 };
@@ -1305,9 +1490,14 @@ async fn stream_common(
     };
 
     let inner = ReaderStream::with_capacity(stream.take(body_len), 512 * 1024);
-    let body_stream = DropNotifyStream {
+    let body_stream = WindowTrackingStream {
         inner: Box::pin(inner),
         on_drop: Some(Box::new(on_drop)),
+        handle: handle.clone(),
+        file_idx,
+        file_len: total_len,
+        position: start,
+        last_update_at: start,
     };
 
     let body = Body::from_stream(body_stream);
@@ -1399,6 +1589,39 @@ impl TorrentService {
         self.handles.write().await.insert(ih.clone(), handle.clone());
         self.touch(&ih).await;
         Ok(handle)
+    }
+
+    /// Remove every torrent except `current_info_hash` in the background.
+    ///
+    /// Spawned as a detached task so the caller returns immediately — session.delete()
+    /// can block waiting for internal cleanup and must not hold up the new request.
+    fn stop_others(self: &Arc<Self>, current_info_hash: &str) {
+        let others: Vec<String> = self
+            .handles
+            // Use try_read so we never block the async task; if the lock is
+            // contended we just skip — the inactivity timer is the safety net.
+            .try_read()
+            .map(|g| {
+                g.keys()
+                    .filter(|h| h.as_str() != current_info_hash)
+                    .cloned()
+                    .collect()
+            })
+            .unwrap_or_default();
+
+        if others.is_empty() {
+            return;
+        }
+
+        let service = Arc::clone(self);
+        tokio::spawn(async move {
+            for hash in others {
+                info!(info_hash = %hash, "stopping torrent (new stream started)");
+                if let Err(err) = service.remove(&hash).await {
+                    warn!(info_hash = %hash, error = %err, "failed to stop old torrent");
+                }
+            }
+        });
     }
 
     async fn get_or_add_magnet(
@@ -1659,20 +1882,20 @@ fn stats_for_handle(
         info_hash: info_hash.clone(),
         name: handle.name().unwrap_or_default(),
         peers: if wires.is_empty() {
-            display_peers
+            display_peers as usize
         } else {
             wires.len()
         },
         unchoked: if live_peers > 1 {
-            live_peers / 2
+            (live_peers / 2) as usize
         } else {
-            live_peers
+            live_peers as usize
         },
-        queued: queued_peers + connecting_peers,
-        unique: unique_peers,
-        connection_tries: dead_peers,
+        queued: (queued_peers + connecting_peers) as usize,
+        unique: unique_peers as usize,
+        connection_tries: dead_peers as usize,
         swarm_paused: matches!(stats.state, librqbit::TorrentStatsState::Paused),
-        swarm_connections: display_peers,
+        swarm_connections: display_peers as usize,
         swarm_size: 400,
         selections: Vec::new(),
         wires: Some(wires),
@@ -1681,7 +1904,7 @@ fn stats_for_handle(
         uploaded: stats.uploaded_bytes,
         download_speed,
         upload_speed: download_speed.max(upload_speed),
-        sources: official_sources(&source_urls, unique_peers.min(400)),
+        sources: official_sources(&source_urls, unique_peers.min(400) as usize),
         peer_search_running: !stats.finished,
         opts: official_stats_opts(&source_urls, &info_hash, cache_dir),
         state: stats.state.to_string(),

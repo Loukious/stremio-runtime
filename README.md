@@ -139,11 +139,6 @@ Legend: ✅ Done · ⚠️ Stub (route exists, returns empty/null) · ❌ TODO
 
 ## TODO List
 
-### P0 gaps (affect current desktop playback)
-
-- [ ] Add conformance tests with captured desktop traffic for create/stats/stream/local-addon flows
-- [ ] Harden local-addon filename parsing and Cinemeta matching for common movie/series release names
-
 ### P1 (desktop polish / compatibility)
 
 - [ ] `GET /probe` — invoke ffprobe, return legacy probe model
@@ -1333,9 +1328,3 @@ routes last.
 - Keep the HTTP endpoint JSON stable while swapping internals.
 - Start with P0 routes and return realistic stub values for P1/P2 only if the current client does not
   call them.
-- Build conformance tests with captured requests:
-  - stats polling
-  - torrent stream range and no-range
-  - `external=1` redirect
-  - subtitles proxy
-  - settings and heartbeat

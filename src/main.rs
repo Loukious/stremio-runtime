@@ -1384,26 +1384,29 @@ fn pick_cinemeta_search_result(catalog: &Value, parsed: &ParsedVideoName) -> Opt
                 .or_else(|| meta.get("id"))
                 .and_then(Value::as_str)?;
             let name = meta.get("name").and_then(Value::as_str).unwrap_or_default();
-            let simplified_name = simplify_video_title(name);
-            let name_score = if simplified_name == simplified_query {
-                100
-            } else if simplified_name.contains(&simplified_query)
-                || simplified_query.contains(&simplified_name)
-            {
-                65
-            } else {
-                0
-            };
+            let mut candidate_titles = vec![name];
+            for key in ["aliases", "aka", "videos"] {
+                if let Some(values) = meta.get(key).and_then(Value::as_array) {
+                    for value in values {
+                        if let Some(title) = value.as_str() {
+                            candidate_titles.push(title);
+                        } else if let Some(title) = value.get("title").and_then(Value::as_str) {
+                            candidate_titles.push(title);
+                        }
+                    }
+                }
+            }
+
+            let name_score = candidate_titles
+                .iter()
+                .map(|title| score_title_match(&simplified_query, &simplify_video_title(title)))
+                .max()
+                .unwrap_or(0);
             if name_score == 0 {
                 return None;
             }
 
-            let result_year = meta
-                .get("releaseInfo")
-                .or_else(|| meta.get("year"))
-                .and_then(Value::as_str)
-                .and_then(|value| value.get(..4))
-                .and_then(|value| value.parse::<i32>().ok());
+            let result_year = meta_year(meta);
             let year_score = match (parsed.year, result_year) {
                 (Some(expected), Some(actual)) if expected == actual => 50,
                 (Some(expected), Some(actual)) if (expected - actual).abs() <= 1 => 20,
@@ -1416,6 +1419,364 @@ fn pick_cinemeta_search_result(catalog: &Value, parsed: &ParsedVideoName) -> Opt
         })
         .max_by_key(|(score, _)| *score)
         .map(|(_, imdb_id)| imdb_id)
+}
+
+fn score_title_match(query: &str, candidate: &str) -> i32 {
+    if query.is_empty() || candidate.is_empty() {
+        0
+    } else if candidate == query {
+        100
+    } else if candidate.contains(query) || query.contains(candidate) {
+        70
+    } else {
+        let query_tokens = title_tokens(query);
+        let candidate_tokens = title_tokens(candidate);
+        if query_tokens.is_empty() || candidate_tokens.is_empty() {
+            return 0;
+        }
+        let overlap = query_tokens
+            .iter()
+            .filter(|token| candidate_tokens.contains(token))
+            .count();
+        let min_len = query_tokens.len().min(candidate_tokens.len());
+        if overlap == min_len && min_len >= 2 {
+            60
+        } else if overlap >= 2 && overlap * 2 >= query_tokens.len().max(candidate_tokens.len()) {
+            45
+        } else {
+            0
+        }
+    }
+}
+
+fn title_tokens(value: &str) -> Vec<String> {
+    static TOKEN_RE: OnceLock<Regex> = OnceLock::new();
+    let token_re = TOKEN_RE.get_or_init(|| Regex::new(r"[a-z0-9]+").expect("regex"));
+    token_re
+        .find_iter(value)
+        .map(|m| m.as_str().to_owned())
+        .filter(|token| !matches!(token.as_str(), "the" | "a" | "an"))
+        .collect()
+}
+
+fn meta_year(meta: &Value) -> Option<i32> {
+    [
+        meta.get("releaseInfo"),
+        meta.get("year"),
+        meta.get("released"),
+        meta.get("publishedAt"),
+    ]
+    .into_iter()
+    .flatten()
+    .filter_map(Value::as_str)
+    .find_map(|value| {
+        Regex::new(r"\b(19\d{2}|20\d{2})\b")
+            .ok()?
+            .find(value)?
+            .as_str()
+            .parse::<i32>()
+            .ok()
+    })
+}
+
+fn parse_video_filename(name: &str) -> Option<ParsedVideoName> {
+    static SEASON_EPISODE_PATTERNS: OnceLock<Vec<Regex>> = OnceLock::new();
+    static YEAR_RE: OnceLock<Regex> = OnceLock::new();
+    static QUALITY_RE: OnceLock<Regex> = OnceLock::new();
+
+    let stem = Path::new(name)
+        .file_stem()
+        .and_then(|stem| stem.to_str())
+        .unwrap_or(name);
+    let normalized = normalize_release_name(stem);
+
+    let season_episode_patterns = SEASON_EPISODE_PATTERNS.get_or_init(|| {
+        [
+            r"(?i)\bS(\d{1,2})\s*E(\d{1,3})\b",
+            r"(?i)\b(\d{1,2})x(\d{1,3})\b",
+            r"(?i)\bSeason\s*(\d{1,2})\s*Episode\s*(\d{1,3})\b",
+            r"(?i)\bS(\d{1,2})\b.*?\bE(\d{1,3})\b",
+        ]
+        .into_iter()
+        .filter_map(|pattern| Regex::new(pattern).ok())
+        .collect()
+    });
+
+    let season_episode = season_episode_patterns.iter().find_map(|re| {
+        re.captures(&normalized).and_then(|captures| {
+            let whole = captures.get(0)?;
+            let season = captures.get(1)?.as_str().parse::<u32>().ok()?;
+            let episode = captures.get(2)?.as_str().parse::<u32>().ok()?;
+            Some((whole.start(), season, episode))
+        })
+    });
+
+    let year_re = YEAR_RE.get_or_init(|| Regex::new(r"\b(19\d{2}|20\d{2})\b").expect("regex"));
+    let year_match = year_re
+        .find(&normalized)
+        .and_then(|m| m.as_str().parse::<i32>().ok().map(|year| (m.start(), year)));
+
+    let quality_re = QUALITY_RE.get_or_init(|| {
+        Regex::new(
+            r"(?i)\b(2160p|1080p|720p|480p|4k|8k|web[- ]?dl|webrip|web|bluray|blu[- ]?ray|brrip|hdrip|hdtv|dvdrip|remux|xvid|x264|x265|h\.?264|h\.?265|hevc|av1|aac|ddp?5?\.?1|atmos|proper|repack|internal|limited|extended|remastered|10bit|8bit)\b",
+        )
+        .expect("regex")
+    });
+    let quality_match = quality_re.find(&normalized).map(|m| m.start());
+
+    let cutoff = [
+        season_episode.map(|(idx, _, _)| idx),
+        year_match.map(|(idx, _)| idx),
+        quality_match,
+    ]
+    .into_iter()
+    .flatten()
+    .min()
+    .unwrap_or_else(|| normalized.len());
+    let parsed_name = cleanup_video_title(&normalized[..cutoff]);
+    if parsed_name.is_empty() {
+        return None;
+    }
+
+    Some(ParsedVideoName {
+        name: parsed_name,
+        year: year_match.map(|(_, year)| year),
+        season: season_episode.map(|(_, season, _)| season),
+        episode: season_episode.map(|(_, _, episode)| episode),
+        kind: if season_episode.is_some() {
+            ParsedVideoKind::Series
+        } else {
+            ParsedVideoKind::Movie
+        },
+    })
+}
+
+fn normalize_release_name(value: &str) -> String {
+    static BRACKET_RE: OnceLock<Regex> = OnceLock::new();
+    static SEP_RE: OnceLock<Regex> = OnceLock::new();
+    static SPACES_RE: OnceLock<Regex> = OnceLock::new();
+
+    let bracket_re =
+        BRACKET_RE.get_or_init(|| Regex::new(r"[\[\(\{][^\]\)\}]*[\]\)\}]").expect("regex"));
+    let sep_re = SEP_RE.get_or_init(|| Regex::new(r"[._+\-]+").expect("regex"));
+    let spaces_re = SPACES_RE.get_or_init(|| Regex::new(r"\s+").expect("regex"));
+
+    let no_brackets = bracket_re.replace_all(value, " ");
+    let separated = sep_re.replace_all(&no_brackets, " ");
+    spaces_re.replace_all(separated.trim(), " ").to_string()
+}
+
+fn cleanup_video_title(value: &str) -> String {
+    value
+        .split_whitespace()
+        .take_while(|part| !is_release_noise_token(part))
+        .filter(|part| !is_release_noise_token(part))
+        .collect::<Vec<_>>()
+        .join(" ")
+        .trim_matches(|ch: char| !ch.is_ascii_alphanumeric())
+        .trim()
+        .to_owned()
+}
+
+fn is_release_noise_token(part: &str) -> bool {
+    let lower = part
+        .trim_matches(|ch: char| !ch.is_ascii_alphanumeric())
+        .to_ascii_lowercase();
+    lower.is_empty()
+        || matches!(
+            lower.as_str(),
+            "1080p"
+                | "720p"
+                | "2160p"
+                | "480p"
+                | "4k"
+                | "8k"
+                | "webrip"
+                | "web"
+                | "webdl"
+                | "web-dl"
+                | "bluray"
+                | "blu-ray"
+                | "brrip"
+                | "hdrip"
+                | "hdtv"
+                | "dvdrip"
+                | "remux"
+                | "xvid"
+                | "x264"
+                | "x265"
+                | "h264"
+                | "h265"
+                | "hevc"
+                | "av1"
+                | "aac"
+                | "dd"
+                | "ddp"
+                | "dd5"
+                | "ddp5"
+                | "atmos"
+                | "proper"
+                | "repack"
+                | "internal"
+                | "limited"
+                | "extended"
+                | "remastered"
+                | "10bit"
+                | "8bit"
+                | "yify"
+                | "rarbg"
+                | "eztv"
+                | "psa"
+        )
+}
+
+fn simplify_video_title(value: &str) -> String {
+    value
+        .chars()
+        .flat_map(char::to_lowercase)
+        .filter(|ch| ch.is_ascii_alphanumeric())
+        .collect()
+}
+
+fn discover_local_addon_files(app_path: &Path) -> Vec<LocalAddonEntry> {
+    let mut paths = Vec::new();
+    collect_local_addon_dir(&app_path.join("localFiles"), &mut paths);
+    collect_platform_local_addon_paths(&mut paths);
+
+    let mut seen = HashSet::new();
+    let mut out = Vec::new();
+    for path in paths {
+        if out.len() >= 10_000 {
+            break;
+        }
+        let key = path.to_string_lossy().into_owned();
+        if !seen.insert(key) {
+            continue;
+        }
+        match local_addon_entry_from_path(&path) {
+            Ok(Some(entry)) => out.push(entry),
+            Ok(None) => {}
+            Err(err) => debug!(path = %path.display(), error = %err, "local addon entry skipped"),
+        }
+    }
+    out
+}
+
+fn collect_local_addon_dir(path: &Path, out: &mut Vec<PathBuf>) {
+    let Ok(entries) = std::fs::read_dir(path) else {
+        return;
+    };
+
+    for entry in entries.flatten() {
+        let path = entry.path();
+        let Ok(metadata) = entry.metadata() else {
+            continue;
+        };
+        if metadata.is_dir() {
+            collect_local_addon_dir(&path, out);
+            continue;
+        }
+        if !metadata.is_file() || !is_interesting_local_addon_file(&path) {
+            continue;
+        }
+        out.push(path);
+    }
+}
+
+fn collect_platform_local_addon_paths(out: &mut Vec<PathBuf>) {
+    #[cfg(target_os = "windows")]
+    {
+        let query = "SELECT System.ItemUrl FROM SystemIndex WHERE scope='file:' AND (System.Kind IS Null OR System.Kind = 'Video') AND System.FileAttributes <> ALL BITWISE 0x2 AND NOT System.ItemUrl LIKE '%/Program Files%' AND NOT System.ItemUrl LIKE '%/SteamLibrary/%' AND NOT System.ItemUrl LIKE '%/node_modules/%' AND (System.FileExtension = '.torrent' OR System.FileExtension = '.mp4' OR System.FileExtension = '.mkv' OR System.FileExtension = '.avi')";
+        let script = format!(
+            "$conn = New-Object -ComObject ADODB.Connection; \
+             $rs = New-Object -ComObject ADODB.Recordset; \
+             $conn.Open('Provider=Search.CollatorDSO;Extended Properties=\"Application=Windows\"'); \
+             $rs.Open(\"{}\", $conn); \
+             while (-not $rs.EOF) {{ $url = [string]$rs.Fields.Item('System.ItemUrl').Value; if ($url.StartsWith('file:')) {{ ([Uri]$url).LocalPath }}; $rs.MoveNext() }}; \
+             $rs.Close(); $conn.Close();",
+            query.replace('"', "`\"")
+        );
+        match Command::new("powershell")
+            .args([
+                "-NoProfile",
+                "-ExecutionPolicy",
+                "Bypass",
+                "-Command",
+                &script,
+            ])
+            .output()
+        {
+            Ok(output) if output.status.success() => {
+                for line in String::from_utf8_lossy(&output.stdout).lines() {
+                    let trimmed = line.trim();
+                    if !trimmed.is_empty() {
+                        out.push(PathBuf::from(trimmed));
+                    }
+                }
+            }
+            Ok(output) => debug!(
+                status = ?output.status.code(),
+                stderr = %String::from_utf8_lossy(&output.stderr),
+                "windows local addon discovery failed"
+            ),
+            Err(err) => debug!(error = %err, "windows local addon discovery unavailable"),
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    {
+        match Command::new("mdfind")
+            .arg("(kMDItemFSName=*.avi || kMDItemFSName=*.mp4 || kMDItemFSName=*.mkv || kMDItemFSName=*.torrent)")
+            .output()
+        {
+            Ok(output) if output.status.success() => {
+                for line in String::from_utf8_lossy(&output.stdout).lines() {
+                    let trimmed = line.trim();
+                    if !trimmed.is_empty() {
+                        out.push(PathBuf::from(trimmed));
+                    }
+                }
+            }
+            Ok(output) => debug!(
+                status = ?output.status.code(),
+                stderr = %String::from_utf8_lossy(&output.stderr),
+                "macos local addon discovery failed"
+            ),
+            Err(err) => debug!(error = %err, "macos local addon discovery unavailable"),
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    {
+        if let Some(home) = std::env::var_os("HOME") {
+            let expr =
+                "\\( -iname '*.torrent' -o -iname '*.mp4' -o -iname '*.mkv' -o -iname '*.avi' \\)";
+            match Command::new("sh")
+                .arg("-c")
+                .arg(format!(
+                    "find \"$1\" -maxdepth 7 -type f {expr} 2>/dev/null"
+                ))
+                .arg("find")
+                .arg(home)
+                .output()
+            {
+                Ok(output) if output.status.success() => {
+                    for line in String::from_utf8_lossy(&output.stdout).lines() {
+                        let trimmed = line.trim();
+                        if !trimmed.is_empty() {
+                            out.push(PathBuf::from(trimmed));
+                        }
+                    }
+                }
+                Ok(output) => debug!(
+                    status = ?output.status.code(),
+                    stderr = %String::from_utf8_lossy(&output.stderr),
+                    "linux local addon discovery failed"
+                ),
+                Err(err) => debug!(error = %err, "linux local addon discovery unavailable"),
+            }
+        }
+    }
 }
 
 fn local_addon_video_id(imdb_id: Option<&str>, parsed: Option<&ParsedVideoName>) -> Option<String> {
@@ -1607,236 +1968,6 @@ fn filter_cinemeta_meta(meta: &Map<String, Value>) -> Value {
             .or_insert_with(|| json!(format!("{METAHUB_BASE_URL}/logo/medium/{imdb_id}/img")));
     }
     Value::Object(out)
-}
-
-fn parse_video_filename(name: &str) -> Option<ParsedVideoName> {
-    let stem = Path::new(name)
-        .file_stem()
-        .and_then(|stem| stem.to_str())
-        .unwrap_or(name);
-    let normalized = stem.replace(['.', '_', '-'], " ");
-
-    let season_episode = RegexBuilder::new(r"(?i)\bS(\d{1,2})\s*E(\d{1,3})\b")
-        .build()
-        .ok()
-        .and_then(|re| {
-            re.captures(&normalized).and_then(|captures| {
-                let whole = captures.get(0)?;
-                let season = captures.get(1)?.as_str().parse::<u32>().ok()?;
-                let episode = captures.get(2)?.as_str().parse::<u32>().ok()?;
-                Some((whole.start(), season, episode))
-            })
-        });
-
-    let year_match = RegexBuilder::new(r"\b(19\d{2}|20\d{2})\b")
-        .build()
-        .ok()
-        .and_then(|re| {
-            re.find(&normalized)
-                .and_then(|m| m.as_str().parse::<i32>().ok().map(|year| (m.start(), year)))
-        });
-
-    let cutoff = season_episode
-        .map(|(idx, _, _)| idx)
-        .or_else(|| year_match.map(|(idx, _)| idx))
-        .unwrap_or_else(|| normalized.len());
-    let parsed_name = cleanup_video_title(&normalized[..cutoff]);
-    if parsed_name.is_empty() {
-        return None;
-    }
-
-    Some(ParsedVideoName {
-        name: parsed_name,
-        year: year_match.map(|(_, year)| year),
-        season: season_episode.map(|(_, season, _)| season),
-        episode: season_episode.map(|(_, _, episode)| episode),
-        kind: if season_episode.is_some() {
-            ParsedVideoKind::Series
-        } else {
-            ParsedVideoKind::Movie
-        },
-    })
-}
-
-fn cleanup_video_title(value: &str) -> String {
-    value
-        .split_whitespace()
-        .filter(|part| {
-            let lower = part.to_ascii_lowercase();
-            !matches!(
-                lower.as_str(),
-                "1080p"
-                    | "720p"
-                    | "2160p"
-                    | "480p"
-                    | "webrip"
-                    | "web"
-                    | "webdl"
-                    | "web-dl"
-                    | "bluray"
-                    | "brrip"
-                    | "hdrip"
-                    | "hdtv"
-                    | "x264"
-                    | "x265"
-                    | "h264"
-                    | "h265"
-                    | "hevc"
-            )
-        })
-        .collect::<Vec<_>>()
-        .join(" ")
-        .trim()
-        .to_owned()
-}
-
-fn simplify_video_title(value: &str) -> String {
-    value
-        .chars()
-        .flat_map(char::to_lowercase)
-        .filter(|ch| ch.is_ascii_alphanumeric())
-        .collect()
-}
-
-fn discover_local_addon_files(app_path: &Path) -> Vec<LocalAddonEntry> {
-    let mut paths = Vec::new();
-    collect_local_addon_dir(&app_path.join("localFiles"), &mut paths);
-    collect_platform_local_addon_paths(&mut paths);
-
-    let mut seen = HashSet::new();
-    let mut out = Vec::new();
-    for path in paths {
-        if out.len() >= 10_000 {
-            break;
-        }
-        let key = path.to_string_lossy().into_owned();
-        if !seen.insert(key) {
-            continue;
-        }
-        match local_addon_entry_from_path(&path) {
-            Ok(Some(entry)) => out.push(entry),
-            Ok(None) => {}
-            Err(err) => debug!(path = %path.display(), error = %err, "local addon entry skipped"),
-        }
-    }
-    out
-}
-
-fn collect_local_addon_dir(path: &Path, out: &mut Vec<PathBuf>) {
-    let Ok(entries) = std::fs::read_dir(path) else {
-        return;
-    };
-
-    for entry in entries.flatten() {
-        let path = entry.path();
-        let Ok(metadata) = entry.metadata() else {
-            continue;
-        };
-        if metadata.is_dir() {
-            collect_local_addon_dir(&path, out);
-            continue;
-        }
-        if !metadata.is_file() || !is_interesting_local_addon_file(&path) {
-            continue;
-        }
-        out.push(path);
-    }
-}
-
-fn collect_platform_local_addon_paths(out: &mut Vec<PathBuf>) {
-    #[cfg(target_os = "windows")]
-    {
-        let query = "SELECT System.ItemUrl FROM SystemIndex WHERE scope='file:' AND (System.Kind IS Null OR System.Kind = 'Video') AND System.FileAttributes <> ALL BITWISE 0x2 AND NOT System.ItemUrl LIKE '%/Program Files%' AND NOT System.ItemUrl LIKE '%/SteamLibrary/%' AND NOT System.ItemUrl LIKE '%/node_modules/%' AND (System.FileExtension = '.torrent' OR System.FileExtension = '.mp4' OR System.FileExtension = '.mkv' OR System.FileExtension = '.avi')";
-        let script = format!(
-            "$conn = New-Object -ComObject ADODB.Connection; \
-             $rs = New-Object -ComObject ADODB.Recordset; \
-             $conn.Open('Provider=Search.CollatorDSO;Extended Properties=\"Application=Windows\"'); \
-             $rs.Open(\"{}\", $conn); \
-             while (-not $rs.EOF) {{ $url = [string]$rs.Fields.Item('System.ItemUrl').Value; if ($url.StartsWith('file:')) {{ ([Uri]$url).LocalPath }}; $rs.MoveNext() }}; \
-             $rs.Close(); $conn.Close();",
-            query.replace('"', "`\"")
-        );
-        match Command::new("powershell")
-            .args([
-                "-NoProfile",
-                "-ExecutionPolicy",
-                "Bypass",
-                "-Command",
-                &script,
-            ])
-            .output()
-        {
-            Ok(output) if output.status.success() => {
-                for line in String::from_utf8_lossy(&output.stdout).lines() {
-                    let trimmed = line.trim();
-                    if !trimmed.is_empty() {
-                        out.push(PathBuf::from(trimmed));
-                    }
-                }
-            }
-            Ok(output) => debug!(
-                status = ?output.status.code(),
-                stderr = %String::from_utf8_lossy(&output.stderr),
-                "windows local addon discovery failed"
-            ),
-            Err(err) => debug!(error = %err, "windows local addon discovery unavailable"),
-        }
-    }
-
-    #[cfg(target_os = "macos")]
-    {
-        match Command::new("mdfind")
-            .arg("(kMDItemFSName=*.avi || kMDItemFSName=*.mp4 || kMDItemFSName=*.mkv || kMDItemFSName=*.torrent)")
-            .output()
-        {
-            Ok(output) if output.status.success() => {
-                for line in String::from_utf8_lossy(&output.stdout).lines() {
-                    let trimmed = line.trim();
-                    if !trimmed.is_empty() {
-                        out.push(PathBuf::from(trimmed));
-                    }
-                }
-            }
-            Ok(output) => debug!(
-                status = ?output.status.code(),
-                stderr = %String::from_utf8_lossy(&output.stderr),
-                "macos local addon discovery failed"
-            ),
-            Err(err) => debug!(error = %err, "macos local addon discovery unavailable"),
-        }
-    }
-
-    #[cfg(target_os = "linux")]
-    {
-        if let Some(home) = std::env::var_os("HOME") {
-            let expr =
-                "\\( -iname '*.torrent' -o -iname '*.mp4' -o -iname '*.mkv' -o -iname '*.avi' \\)";
-            match Command::new("sh")
-                .arg("-c")
-                .arg(format!(
-                    "find \"$1\" -maxdepth 7 -type f {expr} 2>/dev/null"
-                ))
-                .arg("find")
-                .arg(home)
-                .output()
-            {
-                Ok(output) if output.status.success() => {
-                    for line in String::from_utf8_lossy(&output.stdout).lines() {
-                        let trimmed = line.trim();
-                        if !trimmed.is_empty() {
-                            out.push(PathBuf::from(trimmed));
-                        }
-                    }
-                }
-                Ok(output) => debug!(
-                    status = ?output.status.code(),
-                    stderr = %String::from_utf8_lossy(&output.stderr),
-                    "linux local addon discovery failed"
-                ),
-                Err(err) => debug!(error = %err, "linux local addon discovery unavailable"),
-            }
-        }
-    }
 }
 
 fn local_addon_entry_from_path(path: &Path) -> anyhow::Result<Option<LocalAddonEntry>> {
@@ -2102,6 +2233,10 @@ async fn local_addon_manifest(State(state): State<AppState>) -> Json<Value> {
         .get("localAddonEnabled")
         .and_then(Value::as_bool)
         .unwrap_or(false);
+    Json(local_addon_manifest_payload(catalog_enabled))
+}
+
+fn local_addon_manifest_payload(catalog_enabled: bool) -> Value {
     let catalogs = if catalog_enabled {
         json!([
             {
@@ -2145,7 +2280,7 @@ async fn local_addon_manifest(State(state): State<AppState>) -> Json<Value> {
     } else {
         "Local Files (without catalog support)"
     };
-    Json(json!({
+    json!({
         "id": "org.stremio.local",
         "version": env!("CARGO_PKG_VERSION"),
         "name": name,
@@ -2153,7 +2288,7 @@ async fn local_addon_manifest(State(state): State<AppState>) -> Json<Value> {
         "resources": resources,
         "types": ["movie", "series", "other"],
         "catalogs": catalogs
-    }))
+    })
 }
 
 async fn local_addon_dispatch(
@@ -4817,5 +4952,59 @@ mod tests {
             "\n/proxy/d=https%3A%2F%2Fcdn.example.net&h=User-Agent%3ATest/video/seg.ts?x=1\n"
         ));
         assert!(rewritten.contains("URI=\"keys/file.key\""));
+    }
+
+    #[test]
+    fn parses_common_movie_and_series_release_names() {
+        let movie = parse_video_filename(
+            "Project.Hail.Mary.2026.iNTERNAL.1080p.10bit.WEBRip.2CH.x265.HEVC-PSA.mkv",
+        )
+        .unwrap();
+        assert_eq!(movie.name, "Project Hail Mary");
+        assert_eq!(movie.year, Some(2026));
+        assert_eq!(movie.kind, ParsedVideoKind::Movie);
+
+        let dotted = parse_video_filename("From.S04E03.1080p.WEB.H264-GRACE-HI.srt").unwrap();
+        assert_eq!(dotted.name, "From");
+        assert_eq!(dotted.season, Some(4));
+        assert_eq!(dotted.episode, Some(3));
+        assert_eq!(dotted.kind, ParsedVideoKind::Series);
+
+        let x_style = parse_video_filename("Some.Show.1x02.HDTV.x264-GROUP.mkv").unwrap();
+        assert_eq!(x_style.name, "Some Show");
+        assert_eq!(x_style.season, Some(1));
+        assert_eq!(x_style.episode, Some(2));
+
+        let words =
+            parse_video_filename("The Boys Season 5 Episode 5 One-Shots 720p AMZN WEB-DL.mkv")
+                .unwrap();
+        assert_eq!(words.name, "The Boys");
+        assert_eq!(words.season, Some(5));
+        assert_eq!(words.episode, Some(5));
+    }
+
+    #[test]
+    fn scores_cinemeta_candidates_by_title_alias_and_year() {
+        let parsed = parse_video_filename("Project.Hail.Mary.2026.WEBRip.1080p.H264.mkv").unwrap();
+        let catalog = json!({
+            "metas": [
+                {
+                    "id": "tt0000001",
+                    "name": "Project Hail Mary",
+                    "releaseInfo": "2025"
+                },
+                {
+                    "id": "tt12042730",
+                    "name": "Hail Mary",
+                    "aliases": ["Project Hail Mary"],
+                    "releaseInfo": "2026"
+                }
+            ]
+        });
+
+        assert_eq!(
+            pick_cinemeta_search_result(&catalog, &parsed).as_deref(),
+            Some("tt12042730")
+        );
     }
 }

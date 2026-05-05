@@ -11,6 +11,7 @@ chrono = { version = "0.4", default-features = false, features = ["clock", "std"
 futures-util = "0.3"
 http = "1"
 librqbit = { version = "9.0.0-beta.2", default-features = false, features = ["default-tls"], git = "https://github.com/Loukious/rqbit", branch = "main" }
+librqbit-core = { package = "librqbit-core", version = "5.0.0", git = "https://github.com/Loukious/rqbit", branch = "main" }
 mime_guess = "2"
 percent-encoding = "2"
 regex = "1"

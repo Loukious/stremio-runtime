@@ -115,8 +115,11 @@ Legend: ✅ Done · ⚠️ Stub (route exists, returns empty/null) · ❌ TODO
 - ✅ `GET /local-addon/manifest.json`
 - ✅ `GET /local-addon/meta/other/bt:<infoHash>.json` — creates/loads magnet metadata, returns playable videos
 - ✅ Best-effort Cinemeta/Metahub enrichment for local `bt:` metadata
-- ⚠️ `GET /local-addon/catalog/other/local.json` — returns an empty local catalog; filesystem indexing not implemented
-- ⚠️ Other local-addon resources return empty/null compatibility payloads
+- ✅ `GET /local-addon/catalog/other/local.json` — lists indexed local files when local addon is enabled
+- ✅ `GET /local-addon/meta/other/local:<imdbId>.json` — returns local-file meta with playable file videos
+- ✅ `GET /local-addon/stream/{movie|series}/tt*.json` — returns local-file, indexed `.torrent`, and active-torrent streams
+- ✅ Local indexing scans `appPath/localFiles` plus OS-wide discovery (`Windows Search`, `mdfind`, or `find`)
+- ✅ Local `.torrent` files are parsed into `bt:` catalog/meta/stream entries with tracker sources
 
 ### Casting
 - ⚠️ `GET /casting` — returns a static VLC entry; no real device discovery
@@ -982,6 +985,10 @@ Response:
 
 - `200 application/json; charset=utf-8` with handler result.
 - `500` with `{ "err": "handler error" }` on handler error.
+- `catalog/other/local` indexes enabled local addon files from `appPath/localFiles` and OS discovery.
+- `meta/other/local:<imdbId>` returns local-file metadata and `file://` streams.
+- `meta/other/bt:<infoHash>` returns torrent metadata from an indexed `.torrent` when present, otherwise creates/loads the magnet.
+- `stream/{movie|series}/tt...` returns matching local files, indexed `.torrent` streams, and active torrent streams.
 
 ## Static Sample Routes ❌
 

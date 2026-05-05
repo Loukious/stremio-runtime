@@ -2588,6 +2588,7 @@ dependencies = [
  "futures-util",
  "http",
  "librqbit",
+ "librqbit-core",
  "mime_guess",
  "percent-encoding",
  "regex",

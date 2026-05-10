@@ -250,14 +250,8 @@ async fn stream_common(
     let file_idx = resolve_file_index(&handle, &idx, &query.filters)?;
     let file = file_for_handle(&handle, file_idx)?.context("torrent file not found")?;
 
-    {
-        let torrents = state.torrents.clone();
-        let handle2 = handle.clone();
-        tokio::spawn(async move {
-            if let Err(e) = torrents.select_only_file(&handle2, file_idx).await {
-                warn!(file_idx, "select_only_file failed (non-fatal): {:?}", e.0);
-            }
-        });
+    if let Err(e) = state.torrents.select_only_file(&handle, file_idx).await {
+        warn!(file_idx, "select_only_file failed (non-fatal): {:?}", e.0);
     }
 
     if query.external {

@@ -7,6 +7,20 @@ async fn opensub_hash(State(state): State<AppState>, RawQuery(raw_query): RawQue
         );
     };
 
+    if let Some((info_hash, idx)) = parse_local_torrent_media_url(&url) {
+        match compute_local_opensub_hash(&state, &info_hash, &idx).await {
+            Ok(result) => return opensub_hash_response(StatusCode::OK, None, Some(result)),
+            Err(err) => {
+                debug!(
+                    url,
+                    error = %err,
+                    "local opensubHash unavailable without touching stream priority"
+                );
+                return opensub_hash_response(StatusCode::OK, None, None);
+            }
+        }
+    }
+
     match compute_opensub_hash(&state.client, &url).await {
         Ok(result) => opensub_hash_response(StatusCode::OK, None, Some(result)),
         Err(err) => {
@@ -35,7 +49,7 @@ fn opensub_hash_response(
 #[derive(Debug, Serialize)]
 struct OpenSubHashResult {
     size: u64,
-    hash: String,
+    hash: Option<String>,
 }
 
 async fn compute_opensub_hash(
@@ -69,8 +83,88 @@ async fn compute_opensub_hash(
 
     Ok(OpenSubHashResult {
         size,
-        hash: format!("{hash:016x}"),
+        hash: Some(format!("{hash:016x}")),
     })
+}
+
+async fn compute_local_opensub_hash(
+    state: &AppState,
+    info_hash: &str,
+    idx: &str,
+) -> anyhow::Result<OpenSubHashResult> {
+    let handle = state
+        .torrents
+        .get(info_hash)
+        .await
+        .context("torrent is not active")?;
+
+    let _ = timeout(CREATE_METADATA_GRACE, handle.wait_until_initialized()).await;
+    let file_idx = resolve_file_index(&handle, idx, &[])?;
+    let file = file_for_handle(&handle, file_idx)?.context("torrent file not found")?;
+    let size = file.length;
+
+    if size < OPENSUB_HASH_CHUNK_SIZE {
+        return Ok(OpenSubHashResult { size, hash: None });
+    }
+
+    let stats = handle.stats();
+    let verified = stats
+        .file_progress
+        .get(file_idx)
+        .copied()
+        .unwrap_or(0)
+        .min(size);
+    if verified < size {
+        return Ok(OpenSubHashResult { size, hash: None });
+    }
+
+    let path = state.torrents.cache_dir.join(info_hash).join(&file.path);
+    let hash = compute_opensub_hash_from_file(&path, size).await?;
+    Ok(OpenSubHashResult {
+        size,
+        hash: Some(hash),
+    })
+}
+
+async fn compute_opensub_hash_from_file(path: &Path, size: u64) -> anyhow::Result<String> {
+    let first = read_file_range(path, 0, OPENSUB_HASH_CHUNK_SIZE).await?;
+    let tail_start = size.saturating_sub(OPENSUB_HASH_CHUNK_SIZE);
+    let last = if tail_start == 0 {
+        first.clone()
+    } else {
+        read_file_range(path, tail_start, OPENSUB_HASH_CHUNK_SIZE).await?
+    };
+
+    let mut hash = size;
+    hash = hash.wrapping_add(opensub_chunk_sum(&first));
+    hash = hash.wrapping_add(opensub_chunk_sum(&last));
+    Ok(format!("{hash:016x}"))
+}
+
+async fn read_file_range(path: &Path, start: u64, len: u64) -> anyhow::Result<Vec<u8>> {
+    let mut file = tokio::fs::File::open(path)
+        .await
+        .with_context(|| format!("opening {}", path.display()))?;
+    file.seek(SeekFrom::Start(start))
+        .await
+        .with_context(|| format!("seeking {} to {start}", path.display()))?;
+    let mut bytes = vec![0u8; len as usize];
+    file.read_exact(&mut bytes)
+        .await
+        .with_context(|| format!("reading {} bytes from {}", len, path.display()))?;
+    Ok(bytes)
+}
+
+fn parse_local_torrent_media_url(media_url: &str) -> Option<(String, String)> {
+    let parsed = url::Url::parse(media_url).ok()?;
+    if parsed.scheme() != "http" && parsed.scheme() != "https" {
+        return None;
+    }
+
+    let mut segments = parsed.path_segments()?;
+    let info_hash = normalize_info_hash(segments.next()?).ok()?;
+    let idx = segments.next()?.to_string();
+    Some((info_hash, idx))
 }
 
 struct ByteRangeResponse {

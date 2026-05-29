@@ -1,3 +1,6 @@
+static STREAM_REQUEST_ID: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(1);
+
 async fn probe() -> Json<Value> {
     Json(json!({
         "error": null,
@@ -170,6 +173,8 @@ async fn stream_common(
     headers: HeaderMap,
 ) -> AppResult<Response> {
     let t0 = std::time::Instant::now();
+    let request_id =
+        STREAM_REQUEST_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     let query = parse_stream_query(raw_query.as_deref());
     let normalized_info_hash = match normalize_info_hash(&info_hash) {
         Ok(hash) => hash,
@@ -186,9 +191,12 @@ async fn stream_common(
         .to_owned();
 
     info!(
+        request_id,
         info_hash,
         idx,
+        method = %method,
         range = %range_header,
+        raw_query = raw_query.as_deref().unwrap_or(""),
         "[TIMING] request received",
     );
 
@@ -205,6 +213,7 @@ async fn stream_common(
         .await?;
 
     info!(
+        request_id,
         info_hash,
         elapsed_ms = t0.elapsed().as_millis(),
         "[TIMING] torrent handle acquired"
@@ -215,6 +224,7 @@ async fn stream_common(
         Ok(Ok(())) => {}
         Ok(Err(err)) => {
             warn!(
+                request_id,
                 info_hash,
                 "[TIMING] torrent initialization failed after {}ms: {err:#}",
                 t0.elapsed().as_millis()
@@ -228,6 +238,7 @@ async fn stream_common(
         }
         Err(_elapsed) => {
             warn!(
+                request_id,
                 info_hash,
                 "[TIMING] timed out waiting for torrent metadata after {}ms",
                 t0.elapsed().as_millis()
@@ -242,6 +253,7 @@ async fn stream_common(
     }
 
     info!(
+        request_id,
         info_hash,
         elapsed_ms = t0.elapsed().as_millis(),
         "[TIMING] wait_until_initialized done"
@@ -249,9 +261,33 @@ async fn stream_common(
 
     let file_idx = resolve_file_index(&handle, &idx, &query.filters)?;
     let file = file_for_handle(&handle, file_idx)?.context("torrent file not found")?;
+    let stats = handle.stats();
+    let file_verified = stats
+        .file_progress
+        .get(file_idx)
+        .copied()
+        .unwrap_or(0)
+        .min(file.length);
+
+    info!(
+        request_id,
+        info_hash,
+        file_idx,
+        file_name = %file.name,
+        file_len = file.length,
+        file_verified,
+        torrent_verified = stats.progress_bytes,
+        torrent_state = %stats.state,
+        "[TIMING] resolved stream file"
+    );
 
     if let Err(e) = state.torrents.select_only_file(&handle, file_idx).await {
-        warn!(file_idx, "select_only_file failed (non-fatal): {:?}", e.0);
+        warn!(
+            request_id,
+            file_idx,
+            "select_only_file failed (non-fatal): {:?}",
+            e.0
+        );
     }
 
     if query.external {
@@ -276,14 +312,6 @@ async fn stream_common(
         None => (StatusCode::OK, 0, total_len.saturating_sub(1)),
     };
 
-    info!(
-        info_hash,
-        elapsed_ms = t0.elapsed().as_millis(),
-        start,
-        total_len,
-        "[TIMING] range parsed, setting streaming window",
-    );
-
     let initial_near_eof =
         total_len > 0 && total_len.saturating_sub(start) < STREAM_WINDOW_EOF_ZONE;
     let initial_backward = if initial_near_eof {
@@ -292,10 +320,26 @@ async fn stream_common(
         STREAM_WINDOW_BACKWARD
     };
 
+    info!(
+        request_id,
+        info_hash,
+        elapsed_ms = t0.elapsed().as_millis(),
+        status = %status,
+        start,
+        end,
+        body_len = if total_len == 0 { 0 } else { end - start + 1 },
+        total_len,
+        near_eof = initial_near_eof,
+        initial_backward,
+        forward = STREAM_WINDOW_FORWARD,
+        "[TIMING] range parsed, setting streaming window",
+    );
+
     let _ =
         handle.update_streaming_window(file_idx, start, initial_backward, STREAM_WINDOW_FORWARD);
 
     info!(
+        request_id,
         info_hash,
         elapsed_ms = t0.elapsed().as_millis(),
         "[TIMING] calling stream()"
@@ -304,6 +348,7 @@ async fn stream_common(
     let mut stream = match timeout(STREAM_OPEN_TIMEOUT, handle.clone().stream(file_idx)).await {
         Ok(Ok(s)) => {
             info!(
+                request_id,
                 info_hash,
                 elapsed_ms = t0.elapsed().as_millis(),
                 "[TIMING] stream() opened"
@@ -343,6 +388,7 @@ async fn stream_common(
 
     if start > 0 {
         info!(
+            request_id,
             info_hash,
             start,
             elapsed_ms = t0.elapsed().as_millis(),
@@ -351,6 +397,7 @@ async fn stream_common(
         match timeout(STREAM_OPEN_TIMEOUT, stream.seek(SeekFrom::Start(start))).await {
             Ok(Ok(_)) => {
                 info!(
+                    request_id,
                     info_hash,
                     start,
                     elapsed_ms = t0.elapsed().as_millis(),
@@ -359,6 +406,7 @@ async fn stream_common(
             }
             Ok(Err(err)) => {
                 warn!(
+                    request_id,
                     info_hash,
                     file_idx,
                     start,
@@ -374,6 +422,7 @@ async fn stream_common(
             }
             Err(_elapsed) => {
                 warn!(
+                    request_id,
                     info_hash,
                     file_idx,
                     start,
@@ -440,6 +489,15 @@ async fn stream_common(
     }
 
     state.torrents.stream_started(&normalized_info_hash).await;
+    info!(
+        request_id,
+        info_hash,
+        file_idx,
+        start,
+        body_len,
+        elapsed_ms = t0.elapsed().as_millis(),
+        "[TIMING] response headers ready, body will wait for torrent bytes"
+    );
 
     let torrents = state.torrents.clone();
     let hash = normalized_info_hash.clone();

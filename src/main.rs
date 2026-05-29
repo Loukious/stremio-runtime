@@ -27,7 +27,7 @@ use axum::{
     routing::{any, get},
 };
 use chrono::{SecondsFormat, Utc};
-use futures_util::{TryStreamExt, stream::Stream};
+use futures_util::{Stream, TryStreamExt};
 use librqbit::{
     AddTorrent, AddTorrentOptions, ConnectionOptions, ListenerOptions, Magnet,
     PeerConnectionOptions, Session, SessionOptions, api::TorrentIdOrHash,
@@ -436,7 +436,7 @@ struct SubtitleExt {
     ext: String,
 }
 
-#[tokio::main]
+#[tokio::main(worker_threads = 32)]
 async fn main() -> anyhow::Result<()> {
     init_logging();
 
@@ -488,6 +488,9 @@ async fn main() -> anyhow::Result<()> {
             fastresume_folder: Some(cache_dir.join("session")),
             // Lowered from 16: each init SHA-1s in a blocking thread-pool slot.
             concurrent_init_limit: Some(4),
+            // Keep librqbit's blocking disk/checksum work below the runtime's
+            // worker count so lightweight endpoints can still respond.
+            runtime_worker_threads: Some(4),
             trackers,
             ..Default::default()
         },

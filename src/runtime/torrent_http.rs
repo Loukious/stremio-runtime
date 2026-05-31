@@ -138,16 +138,18 @@ async fn remove_all(State(state): State<AppState>) -> Json<Value> {
 
 async fn stream_short(
     State(state): State<AppState>,
+    ConnectInfo(peer_addr): ConnectInfo<SocketAddr>,
     method: Method,
     AxumPath(StreamPath { info_hash, idx }): AxumPath<StreamPath>,
     RawQuery(raw_query): RawQuery,
     headers: HeaderMap,
 ) -> AppResult<Response> {
-    stream_common(state, method, info_hash, idx, raw_query, headers).await
+    stream_common(state, peer_addr, method, info_hash, idx, raw_query, headers).await
 }
 
 async fn stream_named(
     State(state): State<AppState>,
+    ConnectInfo(peer_addr): ConnectInfo<SocketAddr>,
     method: Method,
     AxumPath(StreamNamedPath {
         info_hash,
@@ -161,11 +163,12 @@ async fn stream_named(
         info_hash,
         idx, filename, "stream request with filename path"
     );
-    stream_common(state, method, info_hash, idx, raw_query, headers).await
+    stream_common(state, peer_addr, method, info_hash, idx, raw_query, headers).await
 }
 
 async fn stream_common(
     state: AppState,
+    peer_addr: SocketAddr,
     method: Method,
     info_hash: String,
     idx: String,
@@ -200,14 +203,16 @@ async fn stream_common(
         "[TIMING] request received",
     );
 
-    let playback_owner = headers
-        .get("x-stremio-playback-owner")
-        .and_then(|value| value.to_str().ok());
+    let playback_owner = playback_owner(
+        headers
+            .get("x-stremio-playback-owner")
+            .and_then(|value| value.to_str().ok()),
+        headers
+            .get("x-real-ip")
+            .and_then(|value| value.to_str().ok()),
+        peer_addr,
+    );
     let initial_file_idx = idx.parse::<isize>().ok().and_then(valid_idx);
-    state
-        .torrents
-        .assign_owner(playback_owner, &normalized_info_hash)
-        .await;
 
     let handle = state
         .torrents
@@ -287,17 +292,26 @@ async fn stream_common(
         "[TIMING] resolved stream file"
     );
 
-    if let Err(e) = state
-        .torrents
-        .select_file(&handle, file_idx, playback_owner)
-        .await
-    {
-        warn!(
-            request_id,
-            file_idx,
-            "select_file failed (non-fatal): {:?}",
-            e.0
-        );
+    if method != Method::HEAD {
+        state
+            .torrents
+            .assign_owner(Some(&playback_owner), &normalized_info_hash)
+            .await;
+    }
+
+    if method != Method::HEAD {
+        if let Err(e) = state
+            .torrents
+            .select_file(&handle, file_idx, Some(&playback_owner))
+            .await
+        {
+            warn!(
+                request_id,
+                file_idx,
+                "select_file failed (non-fatal): {:?}",
+                e.0
+            );
+        }
     }
 
     if query.external {

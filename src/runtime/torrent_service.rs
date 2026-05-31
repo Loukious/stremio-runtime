@@ -1026,6 +1026,21 @@ fn normalize_playback_owner(input: &str) -> Option<String> {
     Some(owner.to_string())
 }
 
+fn playback_owner(header: Option<&str>, real_ip_header: Option<&str>, peer_addr: SocketAddr) -> String {
+    header
+        .and_then(normalize_playback_owner)
+        .unwrap_or_else(|| {
+            let ip = if peer_addr.ip().is_loopback() {
+                real_ip_header
+                    .and_then(|value| value.trim().parse::<IpAddr>().ok())
+                    .unwrap_or_else(|| peer_addr.ip())
+            } else {
+                peer_addr.ip()
+            };
+            format!("ip-{ip}").replace(':', "_")
+        })
+}
+
 fn merge_trackers<I>(extra: I) -> Vec<String>
 where
     I: IntoIterator<Item = String>,

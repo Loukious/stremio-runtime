@@ -14,7 +14,7 @@ use anyhow::{Context, anyhow};
 use axum::{
     Json, Router,
     body::{Body, Bytes},
-    extract::{Path as AxumPath, RawQuery, State},
+    extract::{ConnectInfo, Path as AxumPath, RawQuery, State},
     http::{
         HeaderMap, HeaderValue, Method, StatusCode,
         header::{
@@ -60,8 +60,8 @@ const STREAM_INIT_TIMEOUT: Duration = Duration::from_secs(14);
 // we time them out separately so the runtime stays responsive.
 const STREAM_OPEN_TIMEOUT: Duration = Duration::from_secs(10);
 const CREATE_METADATA_GRACE: Duration = Duration::from_millis(1500);
-const ENGINE_INACTIVITY_TIMEOUT: Duration = Duration::from_secs(2 * 60);
-const ENGINE_CLEANUP_INTERVAL: Duration = Duration::from_secs(10);
+const ENGINE_INACTIVITY_TIMEOUT: Duration = Duration::from_secs(30);
+const ENGINE_CLEANUP_INTERVAL: Duration = Duration::from_secs(5);
 const CACHE_REAPER_INTERVAL: Duration = Duration::from_secs(60);
 
 // ── Streaming window tuning ───────────────────────────────────────────────────
@@ -590,7 +590,12 @@ async fn main() -> anyhow::Result<()> {
     info!("{STARTUP_NAME} listening on {base_url}");
     // this line is needed for the service to work with non-modified Stremio clients, as they rely on it to detect the server and get its URL
     println!("EngineFS server started at {base_url}");
-    axum::serve(listener, app).await.context("serving HTTP")?;
+    axum::serve(
+        listener,
+        app.into_make_service_with_connect_info::<SocketAddr>(),
+    )
+    .await
+    .context("serving HTTP")?;
     Ok(())
 }
 
@@ -969,6 +974,31 @@ mod tests {
         );
         assert_eq!(normalize_playback_owner("bad owner"), None);
         assert_eq!(normalize_playback_owner("../bad"), None);
+    }
+
+    #[test]
+    fn uses_header_or_ip_as_playback_owner() {
+        let ipv4 = "192.0.2.4:1234".parse().unwrap();
+        let ipv6 = "[2001:db8::4]:1234".parse().unwrap();
+        let loopback = "127.0.0.1:1234".parse().unwrap();
+        assert_eq!(playback_owner(Some("device_1"), None, ipv4), "device_1");
+        assert_eq!(
+            playback_owner(Some("bad owner"), None, ipv4),
+            "ip-192.0.2.4"
+        );
+        assert_eq!(playback_owner(None, None, ipv6), "ip-2001_db8__4");
+        assert_eq!(
+            playback_owner(None, Some("198.51.100.7"), loopback),
+            "ip-198.51.100.7"
+        );
+        assert_eq!(
+            playback_owner(None, Some("198.51.100.7"), ipv4),
+            "ip-192.0.2.4"
+        );
+        assert_eq!(
+            playback_owner(None, Some("not-an-ip"), loopback),
+            "ip-127.0.0.1"
+        );
     }
 
     #[test]

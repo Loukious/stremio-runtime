@@ -163,7 +163,7 @@ async fn local_addon_bt_meta(state: &AppState, media_type: &str, id: &str) -> Ap
     }
 
     if let Some((file_idx, _)) = video_files.iter().max_by_key(|(_, file)| file.length) {
-        if let Err(err) = state.torrents.select_only_file(&handle, *file_idx).await {
+        if let Err(err) = state.torrents.select_file(&handle, *file_idx, None).await {
             debug!(info_hash, file_idx, error = %err.0, "local-addon default file selection failed");
         }
     }

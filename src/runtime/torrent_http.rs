@@ -200,8 +200,14 @@ async fn stream_common(
         "[TIMING] request received",
     );
 
+    let playback_owner = headers
+        .get("x-stremio-playback-owner")
+        .and_then(|value| value.to_str().ok());
     let initial_file_idx = idx.parse::<isize>().ok().and_then(valid_idx);
-    state.torrents.stop_others(&normalized_info_hash);
+    state
+        .torrents
+        .assign_owner(playback_owner, &normalized_info_hash)
+        .await;
 
     let handle = state
         .torrents
@@ -281,11 +287,15 @@ async fn stream_common(
         "[TIMING] resolved stream file"
     );
 
-    if let Err(e) = state.torrents.select_only_file(&handle, file_idx).await {
+    if let Err(e) = state
+        .torrents
+        .select_file(&handle, file_idx, playback_owner)
+        .await
+    {
         warn!(
             request_id,
             file_idx,
-            "select_only_file failed (non-fatal): {:?}",
+            "select_file failed (non-fatal): {:?}",
             e.0
         );
     }

@@ -77,39 +77,6 @@ impl TorrentService {
         Ok(handle)
     }
 
-    /// Remove every torrent except `current_info_hash` in the background.
-    ///
-    /// Spawned as a detached task so the caller returns immediately — session.delete()
-    /// can block waiting for internal cleanup and must not hold up the new request.
-    fn stop_others(self: &Arc<Self>, current_info_hash: &str) {
-        let others: Vec<String> = self
-            .handles
-            // Use try_read so we never block the async task; if the lock is
-            // contended we just skip — the inactivity timer is the safety net.
-            .try_read()
-            .map(|g| {
-                g.keys()
-                    .filter(|h| h.as_str() != current_info_hash)
-                    .cloned()
-                    .collect()
-            })
-            .unwrap_or_default();
-
-        if others.is_empty() {
-            return;
-        }
-
-        let service = Arc::clone(self);
-        tokio::spawn(async move {
-            for hash in others {
-                info!(info_hash = %hash, "stopping torrent (new stream started)");
-                if let Err(err) = service.remove(&hash).await {
-                    warn!(info_hash = %hash, error = %err, "failed to stop old torrent");
-                }
-            }
-        });
-    }
-
     async fn get_or_add_magnet(
         &self,
         info_hash: &str,
@@ -138,13 +105,25 @@ impl TorrentService {
         .await
     }
 
-    async fn select_only_file(
+    async fn select_file(
         &self,
         handle: &Arc<librqbit::ManagedTorrent>,
         file_idx: usize,
+        owner: Option<&str>,
     ) -> AppResult<()> {
+        let info_hash = handle.info_hash().as_string();
+        let selected = {
+            let mut selected_files = self.selected_files.write().await;
+            let selected = selected_files.entry(info_hash).or_default();
+            if let Some(owner) = owner.and_then(normalize_playback_owner) {
+                selected.by_owner.insert(owner, file_idx);
+            } else {
+                selected.anonymous.insert(file_idx);
+            }
+            selected.all()
+        };
         self.session
-            .update_only_files(handle, &HashSet::from([file_idx]))
+            .update_only_files(handle, &selected)
             .await
             .with_context(|| format!("selecting only torrent file {file_idx}"))
             .map_err(AppError::from)
@@ -187,11 +166,96 @@ impl TorrentService {
         self.handles.write().await.remove(&info_hash);
         self.last_active.write().await.remove(&info_hash);
         self.active_streams.write().await.remove(&info_hash);
+        self.selected_files.write().await.remove(&info_hash);
+        self.owner_torrents
+            .write()
+            .await
+            .retain(|_, hash| hash != &info_hash);
+        self.torrent_owners.write().await.remove(&info_hash);
         self.session
             .delete(TorrentIdOrHash::parse(&info_hash)?, false)
             .await
             .with_context(|| format!("deleting torrent {info_hash}"))?;
         Ok(())
+    }
+
+    async fn assign_owner(self: &Arc<Self>, owner: Option<&str>, current_info_hash: &str) {
+        let Some(owner) = owner.and_then(normalize_playback_owner) else {
+            return;
+        };
+
+        let previous = self
+            .owner_torrents
+            .write()
+            .await
+            .insert(owner.clone(), current_info_hash.to_string());
+        let Some(previous) = previous.filter(|hash| hash != current_info_hash) else {
+            self.torrent_owners
+                .write()
+                .await
+                .entry(current_info_hash.to_string())
+                .or_default()
+                .insert(owner);
+            return;
+        };
+
+        let should_remove_previous = {
+            let mut torrent_owners = self.torrent_owners.write().await;
+            torrent_owners
+                .entry(current_info_hash.to_string())
+                .or_default()
+                .insert(owner.clone());
+
+            let Some(previous_owners) = torrent_owners.get_mut(&previous) else {
+                return;
+            };
+            previous_owners.remove(&owner);
+            if previous_owners.is_empty() {
+                torrent_owners.remove(&previous);
+                true
+            } else {
+                false
+            }
+        };
+
+        if should_remove_previous {
+            let service = Arc::clone(self);
+            tokio::spawn(async move {
+                service.remove_if_unowned(&previous).await;
+            });
+        } else {
+            self.remove_owner_file_selection(&previous, &owner).await;
+        }
+    }
+
+    async fn remove_owner_file_selection(&self, info_hash: &str, owner: &str) {
+        let selected = {
+            let mut selected_files = self.selected_files.write().await;
+            let Some(selected) = selected_files.get_mut(info_hash) else {
+                return;
+            };
+            selected.by_owner.remove(owner);
+            selected.all()
+        };
+        if selected.is_empty() {
+            return;
+        }
+        let Some(handle) = self.get(info_hash).await else {
+            return;
+        };
+        if let Err(err) = self.session.update_only_files(&handle, &selected).await {
+            warn!(info_hash, error = %err, "failed to update retained torrent files");
+        }
+    }
+
+    async fn remove_if_unowned(&self, info_hash: &str) {
+        if self.torrent_owners.read().await.contains_key(info_hash) {
+            return;
+        }
+        info!(info_hash, "stopping torrent (playback owner switched)");
+        if let Err(err) = self.remove(info_hash).await {
+            warn!(info_hash, error = %err, "failed to stop replaced torrent");
+        }
     }
 
     async fn remove_all(&self) -> anyhow::Result<()> {
@@ -947,6 +1011,19 @@ fn normalize_info_hash(input: &str) -> anyhow::Result<String> {
         .as_id20()
         .map(|id| id.as_string())
         .context("magnet did not contain a v1 BTIH hash")
+}
+
+fn normalize_playback_owner(input: &str) -> Option<String> {
+    let owner = input.trim();
+    if owner.is_empty()
+        || owner.len() > 128
+        || !owner
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_'))
+    {
+        return None;
+    }
+    Some(owner.to_string())
 }
 
 fn merge_trackers<I>(extra: I) -> Vec<String>

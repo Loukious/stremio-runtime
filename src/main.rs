@@ -149,6 +149,9 @@ struct TorrentService {
     handles: RwLock<HashMap<String, Arc<librqbit::ManagedTorrent>>>,
     last_active: RwLock<HashMap<String, Instant>>,
     active_streams: RwLock<HashMap<String, usize>>,
+    selected_files: RwLock<HashMap<String, TorrentFileSelections>>,
+    owner_torrents: RwLock<HashMap<String, String>>,
+    torrent_owners: RwLock<HashMap<String, HashSet<String>>>,
     cache_dir: PathBuf,
 }
 
@@ -158,6 +161,22 @@ struct CacheEntry {
     path: PathBuf,
     size: u64,
     modified: SystemTime,
+}
+
+#[derive(Debug, Default)]
+struct TorrentFileSelections {
+    anonymous: HashSet<usize>,
+    by_owner: HashMap<String, usize>,
+}
+
+impl TorrentFileSelections {
+    fn all(&self) -> HashSet<usize> {
+        self.anonymous
+            .iter()
+            .copied()
+            .chain(self.by_owner.values().copied())
+            .collect()
+    }
 }
 
 struct SettingsStore {
@@ -503,6 +522,9 @@ async fn main() -> anyhow::Result<()> {
         handles: RwLock::new(HashMap::new()),
         last_active: RwLock::new(HashMap::new()),
         active_streams: RwLock::new(HashMap::new()),
+        selected_files: RwLock::new(HashMap::new()),
+        owner_torrents: RwLock::new(HashMap::new()),
+        torrent_owners: RwLock::new(HashMap::new()),
         cache_dir,
     });
 
@@ -937,6 +959,28 @@ mod tests {
     fn computes_opensub_chunk_sum_little_endian() {
         let bytes = [1u8, 0, 0, 0, 0, 0, 0, 0, 2, 0, 0, 0, 0, 0, 0, 0];
         assert_eq!(opensub_chunk_sum(&bytes), 3);
+    }
+
+    #[test]
+    fn validates_playback_owner_header() {
+        assert_eq!(
+            normalize_playback_owner(" 3b8c8dc0-c8ac-408f-83b7-9f2b57082ada "),
+            Some("3b8c8dc0-c8ac-408f-83b7-9f2b57082ada".to_string())
+        );
+        assert_eq!(normalize_playback_owner("bad owner"), None);
+        assert_eq!(normalize_playback_owner("../bad"), None);
+    }
+
+    #[test]
+    fn combines_file_selections_across_playback_owners() {
+        let mut selections = TorrentFileSelections::default();
+        selections.anonymous.insert(1);
+        selections.by_owner.insert("one".to_string(), 2);
+        selections.by_owner.insert("two".to_string(), 3);
+        assert_eq!(selections.all(), HashSet::from([1, 2, 3]));
+
+        selections.by_owner.insert("one".to_string(), 4);
+        assert_eq!(selections.all(), HashSet::from([1, 3, 4]));
     }
 
     #[test]

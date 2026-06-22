@@ -579,10 +579,7 @@ async fn main() -> anyhow::Result<()> {
 
     let listener = bind_http_listener(http_start_port(), 5).await?;
     let addr = listener.local_addr()?;
-    let base_host = discover_ipv4_interfaces()
-        .into_iter()
-        .next()
-        .unwrap_or_else(|| "127.0.0.1".to_string());
+    let base_host = server_base_host(multi_user);
     let base_url = format!("http://{}:{}", base_host, addr.port());
     let state = AppState {
         torrents,
@@ -928,6 +925,17 @@ fn discover_ipv4_interfaces() -> Vec<String> {
     out
 }
 
+fn server_base_host(multi_user: bool) -> String {
+    if !multi_user {
+        return Ipv4Addr::LOCALHOST.to_string();
+    }
+
+    discover_ipv4_interfaces()
+        .into_iter()
+        .next()
+        .unwrap_or_else(|| Ipv4Addr::LOCALHOST.to_string())
+}
+
 include!("runtime/local_addon.rs");
 
 include!("runtime/app_routes.rs");
@@ -945,6 +953,11 @@ include!("runtime/torrent_service.rs");
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn single_user_server_uses_loopback() {
+        assert_eq!(server_base_host(false), "127.0.0.1");
+    }
 
     #[test]
     fn parses_srt_cues() {

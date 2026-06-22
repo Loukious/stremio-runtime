@@ -105,6 +105,50 @@ impl TorrentService {
         .await
     }
 
+    async fn get_or_start_magnet(
+        self: &Arc<Self>,
+        info_hash: &str,
+        query_trackers: Vec<String>,
+        preferred_file_idx: Option<usize>,
+    ) -> AppResult<Option<Arc<librqbit::ManagedTorrent>>> {
+        let info_hash = normalize_info_hash(info_hash)?;
+        if let Some(handle) = self.get(&info_hash).await {
+            return Ok(Some(handle));
+        }
+
+        let should_start = self.pending_magnets.write().await.insert(info_hash.clone());
+        if should_start {
+            let service = Arc::clone(self);
+            let pending_info_hash = info_hash.clone();
+            tokio::spawn(async move {
+                info!(info_hash = %pending_info_hash, "starting background magnet resolution");
+                if let Err(err) = service
+                    .add_magnet(
+                        &pending_info_hash,
+                        &CreateTorrentRequest {
+                            announce: Vec::new(),
+                            file_must_include: Vec::new(),
+                            guess_file_idx: None,
+                            file_idx: preferred_file_idx.map(|idx| idx as isize),
+                            connections: None,
+                            path: None,
+                            initial_peers: Vec::new(),
+                            peers: Vec::new(),
+                            extra: Map::new(),
+                        },
+                        query_trackers,
+                    )
+                    .await
+                {
+                    warn!(info_hash = %pending_info_hash, error = %err.0, "background magnet resolution failed");
+                }
+                service.pending_magnets.write().await.remove(&pending_info_hash);
+            });
+        }
+
+        Ok(None)
+    }
+
     async fn select_file(
         &self,
         handle: &Arc<librqbit::ManagedTorrent>,
@@ -320,12 +364,29 @@ impl TorrentService {
                 continue;
             }
 
+            if !self.multi_user {
+                let Some(handle) = self.get(&hash).await else {
+                    continue;
+                };
+                if !handle.stats().finished {
+                    continue;
+                }
+
+                info!(info_hash = %hash, "completed torrent inactive, destroying it");
+                if let Err(err) = self.remove(&hash).await {
+                    warn!(info_hash = %hash, error = %err, "cleanup remove failed");
+                    continue;
+                }
+                info!(info_hash = %hash, "completed torrent engine destroyed");
+                continue;
+            }
+
             let last = self.last_active.read().await.get(&hash).copied();
             let Some(last) = last else {
                 continue;
             };
 
-            if last.elapsed() <= ENGINE_INACTIVITY_TIMEOUT {
+            if last.elapsed() <= MULTI_USER_ENGINE_INACTIVITY_TIMEOUT {
                 continue;
             }
 
@@ -411,6 +472,22 @@ impl TorrentService {
         }
 
         if total > limit {
+            match self
+                .cleanup_unselected_files_from_active_torrents(total, limit)
+                .await
+            {
+                Ok(new_total) => total = new_total,
+                Err(err) => {
+                    warn!(
+                        cache_dir = %self.cache_dir.display(),
+                        error = %err,
+                        "active torrent file-level cache pruning failed"
+                    );
+                }
+            }
+        }
+
+        if total > limit {
             warn!(
                 cache_dir = %self.cache_dir.display(),
                 total,
@@ -419,6 +496,54 @@ impl TorrentService {
                 "cache remains over limit; remaining data is active or could not be removed"
             );
         }
+    }
+
+    async fn cleanup_unselected_files_from_active_torrents(
+        &self,
+        mut total: u64,
+        limit: u64,
+    ) -> anyhow::Result<u64> {
+        let active_hashes = self.active_cache_keys().await;
+        let handles = self.handles.read().await.clone();
+        let selected_files = self.selected_files.read().await;
+
+        for hash in active_hashes {
+            if total <= limit {
+                break;
+            }
+
+            let Some(handle) = handles.get(&hash) else {
+                continue;
+            };
+            let Some(selected) = selected_files.get(&hash).map(TorrentFileSelections::all) else {
+                continue;
+            };
+            if selected.is_empty() {
+                continue;
+            }
+
+            let Some(freed) = remove_unselected_torrent_files(
+                &self.cache_dir,
+                &hash,
+                handle,
+                &selected,
+            )
+            .await?
+            else {
+                continue;
+            };
+
+            total = total.saturating_sub(freed);
+            info!(
+                info_hash = %hash,
+                freed,
+                remaining = total,
+                limit,
+                "inactive files removed from active torrent cache"
+            );
+        }
+
+        Ok(total)
     }
 
     async fn active_cache_keys(&self) -> HashSet<String> {
@@ -567,6 +692,143 @@ async fn remove_fastresume_for_cache_key(cache_dir: &Path, key: &str) {
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
         Err(err) => {
             warn!(path = %bitv_path.display(), error = %err, "failed to remove fastresume bitfield")
+        }
+    }
+}
+
+async fn remove_unselected_torrent_files(
+    cache_dir: &Path,
+    info_hash: &str,
+    handle: &Arc<librqbit::ManagedTorrent>,
+    selected: &HashSet<usize>,
+) -> anyhow::Result<Option<u64>> {
+    let files = files_for_handle(handle);
+    if files.len() <= selected.len() {
+        return Ok(None);
+    }
+
+    let torrent_dir = cache_dir.join(info_hash);
+    let canonical_torrent_dir = match tokio::fs::canonicalize(&torrent_dir).await {
+        Ok(path) => path,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(err) => {
+            return Err(err).with_context(|| format!("canonicalizing {}", torrent_dir.display()));
+        }
+    };
+
+    let mut removed_any = false;
+    let mut freed = 0u64;
+
+    for (idx, file) in files.iter().enumerate() {
+        if selected.contains(&idx) {
+            continue;
+        }
+
+        let relative_path = Path::new(&file.path);
+        if relative_path.is_absolute()
+            || relative_path
+                .components()
+                .any(|component| matches!(component, std::path::Component::ParentDir))
+        {
+            warn!(
+                info_hash,
+                file_idx = idx,
+                path = %file.path,
+                "skipping suspicious torrent file path during cache pruning"
+            );
+            continue;
+        }
+
+        let path = torrent_dir.join(relative_path);
+        let metadata = match tokio::fs::symlink_metadata(&path).await {
+            Ok(metadata) => metadata,
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(err) => return Err(err).with_context(|| format!("stat {}", path.display())),
+        };
+
+        if !metadata.is_file() {
+            continue;
+        }
+
+        let canonical_parent = match path.parent() {
+            Some(parent) => match tokio::fs::canonicalize(parent).await {
+                Ok(parent) => parent,
+                Err(err) if err.kind() == std::io::ErrorKind::NotFound => continue,
+                Err(err) => {
+                    return Err(err).with_context(|| format!("canonicalizing {}", parent.display()));
+                }
+            },
+            None => continue,
+        };
+        if !canonical_parent.starts_with(&canonical_torrent_dir) {
+            warn!(
+                info_hash,
+                file_idx = idx,
+                path = %path.display(),
+                "refusing to remove torrent file outside torrent cache dir"
+            );
+            continue;
+        }
+
+        tokio::fs::remove_file(&path)
+            .await
+            .with_context(|| format!("removing {}", path.display()))?;
+        freed = freed.saturating_add(metadata.len());
+        removed_any = true;
+        info!(
+            info_hash,
+            file_idx = idx,
+            path = %path.display(),
+            freed = metadata.len(),
+            "inactive torrent file removed from active cache"
+        );
+    }
+
+    if removed_any {
+        remove_fastresume_for_cache_key(cache_dir, info_hash).await;
+        prune_empty_dirs(&torrent_dir, &canonical_torrent_dir).await;
+        Ok(Some(freed))
+    } else {
+        Ok(None)
+    }
+}
+
+async fn prune_empty_dirs(root: &Path, canonical_root: &Path) {
+    let mut stack = vec![root.to_path_buf()];
+    let mut dirs = Vec::new();
+
+    while let Some(path) = stack.pop() {
+        let mut entries = match tokio::fs::read_dir(&path).await {
+            Ok(entries) => entries,
+            Err(_) => continue,
+        };
+
+        while let Ok(Some(entry)) = entries.next_entry().await {
+            let child = entry.path();
+            match entry.file_type().await {
+                Ok(file_type) if file_type.is_dir() => {
+                    stack.push(child.clone());
+                    dirs.push(child);
+                }
+                _ => {}
+            }
+        }
+    }
+
+    dirs.sort_by_key(|path| std::cmp::Reverse(path.components().count()));
+    for dir in dirs {
+        let Ok(canonical_parent) = tokio::fs::canonicalize(dir.parent().unwrap_or(root)).await
+        else {
+            continue;
+        };
+        if !canonical_parent.starts_with(canonical_root) {
+            continue;
+        }
+        match tokio::fs::remove_dir(&dir).await {
+            Ok(()) => debug!(path = %dir.display(), "removed empty torrent cache subdirectory"),
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+            Err(err) if err.kind() == std::io::ErrorKind::DirectoryNotEmpty => {}
+            Err(err) => debug!(path = %dir.display(), error = %err, "empty dir pruning skipped"),
         }
     }
 }

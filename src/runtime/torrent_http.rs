@@ -182,7 +182,7 @@ async fn stream_common(
     let normalized_info_hash = match normalize_info_hash(&info_hash) {
         Ok(hash) => hash,
         Err(err) => {
-            warn!(info_hash, idx, error = %err, "non-torrent stream route hit");
+            debug!(info_hash, idx, error = %err, "non-torrent stream route hit");
             return Ok(StatusCode::NOT_FOUND.into_response());
         }
     };
@@ -216,12 +216,49 @@ async fn stream_common(
 
     let handle = state
         .torrents
-        .get_or_add_magnet(
+        .get_or_start_magnet(
             &normalized_info_hash,
             query.trackers.clone(),
             initial_file_idx,
         )
         .await?;
+    let handle = match handle {
+        Some(handle) => handle,
+        None => {
+            info!(
+                request_id,
+                info_hash,
+                elapsed_ms = t0.elapsed().as_millis(),
+                "[TIMING] waiting for background magnet resolution"
+            );
+            match timeout(STREAM_INIT_TIMEOUT, async {
+                loop {
+                    if let Some(handle) = state.torrents.get(&normalized_info_hash).await {
+                        break handle;
+                    }
+                    sleep(Duration::from_millis(100)).await;
+                }
+            })
+            .await
+            {
+                Ok(handle) => handle,
+                Err(_elapsed) => {
+                    warn!(
+                        request_id,
+                        info_hash,
+                        elapsed_ms = t0.elapsed().as_millis(),
+                        "[TIMING] timed out waiting for background magnet resolution"
+                    );
+                    return Ok((
+                        StatusCode::SERVICE_UNAVAILABLE,
+                        [("Retry-After", "3")],
+                        "waiting for torrent metadata",
+                    )
+                        .into_response());
+                }
+            }
+        }
+    };
 
     info!(
         request_id,
@@ -512,6 +549,61 @@ async fn stream_common(
             .context("building HEAD response")?);
     }
 
+    let probe_prefix_len = body_len.min(STREAM_PROBE_PREFIX_BYTES) as usize;
+    let mut probe_prefix = vec![0u8; probe_prefix_len];
+    match timeout(
+        STREAM_PROBE_PREFIX_TIMEOUT,
+        stream.read_exact(&mut probe_prefix),
+    )
+    .await
+    {
+        Ok(Ok(_)) => {
+            info!(
+                request_id,
+                info_hash,
+                file_idx,
+                start,
+                probe_prefix_len,
+                elapsed_ms = t0.elapsed().as_millis(),
+                "[TIMING] probe prefix ready"
+            );
+        }
+        Ok(Err(err)) => {
+            warn!(
+                request_id,
+                info_hash,
+                file_idx,
+                start,
+                probe_prefix_len,
+                elapsed_ms = t0.elapsed().as_millis(),
+                "[TIMING] probe prefix failed: {err:#}"
+            );
+            return Ok((
+                StatusCode::SERVICE_UNAVAILABLE,
+                [("Retry-After", "2")],
+                "waiting for requested torrent bytes",
+            )
+                .into_response());
+        }
+        Err(_elapsed) => {
+            warn!(
+                request_id,
+                info_hash,
+                file_idx,
+                start,
+                probe_prefix_len,
+                elapsed_ms = t0.elapsed().as_millis(),
+                "[TIMING] probe prefix timed out"
+            );
+            return Ok((
+                StatusCode::SERVICE_UNAVAILABLE,
+                [("Retry-After", "3")],
+                "waiting for requested torrent bytes",
+            )
+                .into_response());
+        }
+    }
+
     state.torrents.stream_started(&normalized_info_hash).await;
     info!(
         request_id,
@@ -520,7 +612,7 @@ async fn stream_common(
         start,
         body_len,
         elapsed_ms = t0.elapsed().as_millis(),
-        "[TIMING] response headers ready, body will wait for torrent bytes"
+        "[TIMING] response body starting"
     );
 
     let torrents = state.torrents.clone();
@@ -531,7 +623,13 @@ async fn stream_common(
         });
     };
 
-    let inner = ReaderStream::with_capacity(stream.take(body_len), 512 * 1024);
+    let probe_prefix = Bytes::from(probe_prefix);
+    let remaining_body_len = body_len.saturating_sub(probe_prefix.len() as u64);
+    let prefix = stream::once(async move { Ok::<Bytes, std::io::Error>(probe_prefix) });
+    let inner = prefix.chain(ReaderStream::with_capacity(
+        stream.take(remaining_body_len),
+        512 * 1024,
+    ));
     let body_stream = WindowTrackingStream {
         inner: Box::pin(inner),
         on_drop: Some(Box::new(on_drop)),

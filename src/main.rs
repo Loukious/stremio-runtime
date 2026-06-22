@@ -27,7 +27,10 @@ use axum::{
     routing::{any, get},
 };
 use chrono::{SecondsFormat, Utc};
-use futures_util::{Stream, TryStreamExt};
+use futures_util::{
+    Stream, StreamExt, TryStreamExt,
+    stream::{self},
+};
 use librqbit::{
     AddTorrent, AddTorrentOptions, ConnectionOptions, ListenerOptions, Magnet,
     PeerConnectionOptions, Session, SessionOptions, api::TorrentIdOrHash,
@@ -59,9 +62,14 @@ const STREAM_INIT_TIMEOUT: Duration = Duration::from_secs(14);
 // Both operations can block a tokio OS thread if pieces aren't on disk yet;
 // we time them out separately so the runtime stays responsive.
 const STREAM_OPEN_TIMEOUT: Duration = Duration::from_secs(10);
+// Wait for enough verified bytes to let mpv identify the container before
+// creating a long-lived HTTP response body. Keep this below yt-dlp's 20s read
+// timeout so failed attempts release their resources cleanly.
+const STREAM_PROBE_PREFIX_BYTES: u64 = 128 * 1024;
+const STREAM_PROBE_PREFIX_TIMEOUT: Duration = Duration::from_secs(18);
 const CREATE_METADATA_GRACE: Duration = Duration::from_millis(1500);
-const ENGINE_INACTIVITY_TIMEOUT: Duration = Duration::from_secs(30);
-const ENGINE_CLEANUP_INTERVAL: Duration = Duration::from_secs(5);
+const MULTI_USER_ENGINE_INACTIVITY_TIMEOUT: Duration = Duration::from_secs(2 * 60);
+const ENGINE_CLEANUP_INTERVAL: Duration = Duration::from_secs(1);
 const CACHE_REAPER_INTERVAL: Duration = Duration::from_secs(60);
 
 // ── Streaming window tuning ───────────────────────────────────────────────────
@@ -114,6 +122,8 @@ const DEFAULT_TRACKERS: &[&str] = &[
     "https://tracker.bt4g.com:443/announce",
 ];
 
+static LOG_GUARD: OnceLock<tracing_appender::non_blocking::WorkerGuard> = OnceLock::new();
+
 const CINEMETA_BASE_URL: &str = "https://v3-cinemeta.strem.io";
 const METAHUB_BASE_URL: &str = "https://images.metahub.space";
 const METAHUB_EPISODES_URL: &str = "https://episodes.metahub.space";
@@ -146,9 +156,11 @@ struct AppState {
 
 struct TorrentService {
     session: Arc<Session>,
+    multi_user: bool,
     handles: RwLock<HashMap<String, Arc<librqbit::ManagedTorrent>>>,
     last_active: RwLock<HashMap<String, Instant>>,
     active_streams: RwLock<HashMap<String, usize>>,
+    pending_magnets: RwLock<HashSet<String>>,
     selected_files: RwLock<HashMap<String, TorrentFileSelections>>,
     owner_torrents: RwLock<HashMap<String, String>>,
     torrent_owners: RwLock<HashMap<String, HashSet<String>>>,
@@ -458,6 +470,15 @@ struct SubtitleExt {
 #[tokio::main(worker_threads = 32)]
 async fn main() -> anyhow::Result<()> {
     init_logging();
+    let multi_user = std::env::args().any(|arg| arg == "--multi-user");
+    info!(
+        mode = if multi_user {
+            "multi-user"
+        } else {
+            "single-user"
+        },
+        "torrent cleanup mode"
+    );
 
     let app_path = server_app_path();
     let settings_path = server_settings_path(&app_path);
@@ -519,9 +540,11 @@ async fn main() -> anyhow::Result<()> {
 
     let torrents = Arc::new(TorrentService {
         session,
+        multi_user,
         handles: RwLock::new(HashMap::new()),
         last_active: RwLock::new(HashMap::new()),
         active_streams: RwLock::new(HashMap::new()),
+        pending_magnets: RwLock::new(HashSet::new()),
         selected_files: RwLock::new(HashMap::new()),
         owner_torrents: RwLock::new(HashMap::new()),
         torrent_owners: RwLock::new(HashMap::new()),
@@ -602,8 +625,11 @@ async fn main() -> anyhow::Result<()> {
 fn init_logging() {
     let filter = std::env::var("RUST_LOG")
         .unwrap_or_else(|_| "stremio_service_rs=debug,librqbit=info,tower_http=warn".to_string());
+    let (non_blocking_writer, guard) = tracing_appender::non_blocking(std::io::stdout());
+    let _ = LOG_GUARD.set(guard);
     tracing_subscriber::fmt()
         .with_env_filter(filter)
+        .with_writer(non_blocking_writer)
         .with_target(false)
         .compact()
         .init();

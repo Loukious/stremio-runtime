@@ -292,6 +292,38 @@ impl TorrentService {
         }
     }
 
+    async fn release_owner(self: &Arc<Self>, owner: &str) {
+        let Some(owner) = normalize_playback_owner(owner) else {
+            return;
+        };
+
+        let Some(info_hash) = self.owner_torrents.write().await.remove(&owner) else {
+            return;
+        };
+
+        let should_remove = {
+            let mut torrent_owners = self.torrent_owners.write().await;
+            match torrent_owners.get_mut(&info_hash) {
+                Some(owners) => {
+                    owners.remove(&owner);
+                    if owners.is_empty() {
+                        torrent_owners.remove(&info_hash);
+                        true
+                    } else {
+                        false
+                    }
+                }
+                None => true,
+            }
+        };
+
+        if should_remove {
+            self.remove_if_unowned(&info_hash).await;
+        } else {
+            self.remove_owner_file_selection(&info_hash, &owner).await;
+        }
+    }
+
     async fn remove_if_unowned(&self, info_hash: &str) {
         if self.torrent_owners.read().await.contains_key(info_hash) {
             return;

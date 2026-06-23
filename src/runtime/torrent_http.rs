@@ -212,6 +212,17 @@ async fn stream_common(
             .and_then(|value| value.to_str().ok()),
         peer_addr,
     );
+    if let Some(download_id) = downloader_id_from_owner(&playback_owner) {
+        if !state.downloads.is_running(download_id).await {
+            info!(
+                request_id,
+                download_id,
+                info_hash,
+                "[TIMING] ignoring canceled downloader stream before torrent start"
+            );
+            return Ok(StatusCode::GONE.into_response());
+        }
+    }
     let initial_file_idx = idx.parse::<isize>().ok().and_then(valid_idx);
 
     let handle = state
@@ -328,6 +339,19 @@ async fn stream_common(
         torrent_state = %stats.state,
         "[TIMING] resolved stream file"
     );
+
+    if let Some(download_id) = downloader_id_from_owner(&playback_owner) {
+        if !state.downloads.is_running(download_id).await {
+            info!(
+                request_id,
+                download_id,
+                info_hash,
+                file_idx,
+                "[TIMING] ignoring canceled downloader stream before file selection"
+            );
+            return Ok(StatusCode::GONE.into_response());
+        }
+    }
 
     if method != Method::HEAD {
         state
@@ -549,61 +573,6 @@ async fn stream_common(
             .context("building HEAD response")?);
     }
 
-    let probe_prefix_len = body_len.min(STREAM_PROBE_PREFIX_BYTES) as usize;
-    let mut probe_prefix = vec![0u8; probe_prefix_len];
-    match timeout(
-        STREAM_PROBE_PREFIX_TIMEOUT,
-        stream.read_exact(&mut probe_prefix),
-    )
-    .await
-    {
-        Ok(Ok(_)) => {
-            info!(
-                request_id,
-                info_hash,
-                file_idx,
-                start,
-                probe_prefix_len,
-                elapsed_ms = t0.elapsed().as_millis(),
-                "[TIMING] probe prefix ready"
-            );
-        }
-        Ok(Err(err)) => {
-            warn!(
-                request_id,
-                info_hash,
-                file_idx,
-                start,
-                probe_prefix_len,
-                elapsed_ms = t0.elapsed().as_millis(),
-                "[TIMING] probe prefix failed: {err:#}"
-            );
-            return Ok((
-                StatusCode::SERVICE_UNAVAILABLE,
-                [("Retry-After", "2")],
-                "waiting for requested torrent bytes",
-            )
-                .into_response());
-        }
-        Err(_elapsed) => {
-            warn!(
-                request_id,
-                info_hash,
-                file_idx,
-                start,
-                probe_prefix_len,
-                elapsed_ms = t0.elapsed().as_millis(),
-                "[TIMING] probe prefix timed out"
-            );
-            return Ok((
-                StatusCode::SERVICE_UNAVAILABLE,
-                [("Retry-After", "3")],
-                "waiting for requested torrent bytes",
-            )
-                .into_response());
-        }
-    }
-
     state.torrents.stream_started(&normalized_info_hash).await;
     info!(
         request_id,
@@ -623,13 +592,7 @@ async fn stream_common(
         });
     };
 
-    let probe_prefix = Bytes::from(probe_prefix);
-    let remaining_body_len = body_len.saturating_sub(probe_prefix.len() as u64);
-    let prefix = stream::once(async move { Ok::<Bytes, std::io::Error>(probe_prefix) });
-    let inner = prefix.chain(ReaderStream::with_capacity(
-        stream.take(remaining_body_len),
-        512 * 1024,
-    ));
+    let inner = ReaderStream::with_capacity(stream.take(body_len), 512 * 1024);
     let body_stream = WindowTrackingStream {
         inner: Box::pin(inner),
         on_drop: Some(Box::new(on_drop)),

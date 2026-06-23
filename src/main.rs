@@ -27,20 +27,17 @@ use axum::{
     routing::{any, get},
 };
 use chrono::{SecondsFormat, Utc};
-use futures_util::{
-    Stream, StreamExt, TryStreamExt,
-    stream::{self},
-};
+use futures_util::{Stream, TryStreamExt};
 use librqbit::{
     AddTorrent, AddTorrentOptions, ConnectionOptions, ListenerOptions, Magnet,
     PeerConnectionOptions, Session, SessionOptions, api::TorrentIdOrHash,
 };
 use librqbit_core::torrent_metainfo::torrent_from_bytes;
-use percent_encoding::{AsciiSet, CONTROLS, utf8_percent_encode};
+use percent_encoding::{AsciiSet, CONTROLS, percent_decode_str, utf8_percent_encode};
 use regex::{Regex, RegexBuilder};
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value, json};
-use tokio::io::{AsyncReadExt, AsyncSeekExt};
+use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt};
 use tokio::net::TcpListener;
 use tokio::sync::RwLock;
 use tokio::time::{sleep, timeout};
@@ -62,11 +59,6 @@ const STREAM_INIT_TIMEOUT: Duration = Duration::from_secs(14);
 // Both operations can block a tokio OS thread if pieces aren't on disk yet;
 // we time them out separately so the runtime stays responsive.
 const STREAM_OPEN_TIMEOUT: Duration = Duration::from_secs(10);
-// Wait for enough verified bytes to let mpv identify the container before
-// creating a long-lived HTTP response body. Keep this below yt-dlp's 20s read
-// timeout so failed attempts release their resources cleanly.
-const STREAM_PROBE_PREFIX_BYTES: u64 = 128 * 1024;
-const STREAM_PROBE_PREFIX_TIMEOUT: Duration = Duration::from_secs(18);
 const CREATE_METADATA_GRACE: Duration = Duration::from_millis(1500);
 const MULTI_USER_ENGINE_INACTIVITY_TIMEOUT: Duration = Duration::from_secs(2 * 60);
 const ENGINE_CLEANUP_INTERVAL: Duration = Duration::from_secs(1);
@@ -152,6 +144,7 @@ struct AppState {
     proxy_client: reqwest::Client,
     settings: Arc<SettingsStore>,
     local_addon: Arc<LocalAddonIndex>,
+    downloads: Arc<DownloadManager>,
 }
 
 struct TorrentService {
@@ -581,28 +574,48 @@ async fn main() -> anyhow::Result<()> {
     let addr = listener.local_addr()?;
     let base_host = server_base_host(multi_user);
     let base_url = format!("http://{}:{}", base_host, addr.port());
+    let client = reqwest::Client::builder()
+        .user_agent("stremio-service-rs/0.1")
+        .http1_only()
+        .connect_timeout(Duration::from_secs(15))
+        .timeout(Duration::from_secs(90))
+        .build()
+        .context("building HTTP client")?;
+    let proxy_client = reqwest::Client::builder()
+        .user_agent("stremio-service-rs/0.1")
+        .http1_only()
+        .redirect(reqwest::redirect::Policy::none())
+        .danger_accept_invalid_certs(true)
+        .danger_accept_invalid_hostnames(true)
+        .connect_timeout(Duration::from_secs(15))
+        .timeout(Duration::from_secs(90))
+        .build()
+        .context("building proxy HTTP client")?;
+    let download_client = reqwest::Client::builder()
+        .user_agent("stremio-service-rs/0.1")
+        .http1_only()
+        .connect_timeout(Duration::from_secs(15))
+        .build()
+        .context("building downloader HTTP client")?;
+    let downloads = Arc::new(
+        DownloadManager::new(
+            app_path.join("downloads"),
+            app_path.join("downManager.json"),
+            download_client,
+            torrents.clone(),
+        )
+        .await
+        .context("starting downloader manager")?,
+    );
+
     let state = AppState {
         torrents,
         base_url: Arc::new(RwLock::new(base_url.clone())),
-        client: reqwest::Client::builder()
-            .user_agent("stremio-service-rs/0.1")
-            .http1_only()
-            .connect_timeout(Duration::from_secs(15))
-            .timeout(Duration::from_secs(90))
-            .build()
-            .context("building HTTP client")?,
-        proxy_client: reqwest::Client::builder()
-            .user_agent("stremio-service-rs/0.1")
-            .http1_only()
-            .redirect(reqwest::redirect::Policy::none())
-            .danger_accept_invalid_certs(true)
-            .danger_accept_invalid_hostnames(true)
-            .connect_timeout(Duration::from_secs(15))
-            .timeout(Duration::from_secs(90))
-            .build()
-            .context("building proxy HTTP client")?,
+        client,
+        proxy_client,
         settings,
         local_addon: Arc::new(LocalAddonIndex::default()),
+        downloads,
     };
 
     let app = router(state);
@@ -669,6 +682,13 @@ fn router(state: AppState) -> Router {
         .route("/stats.json", get(global_stats))
         .route("/removeAll", get(remove_all))
         .route("/create", any(create_from_torrent))
+        .route("/{server_key}/downloader/getAll", get(downloader_get_all))
+        .route("/{server_key}/downloader/get", get(downloader_get))
+        .route("/{server_key}/downloader/add", get(downloader_add))
+        .route("/{server_key}/downloader/pause", get(downloader_pause))
+        .route("/{server_key}/downloader/resume", get(downloader_resume))
+        .route("/{server_key}/downloader/remove", get(downloader_remove))
+        .route("/{server_key}/downloader/stream", get(downloader_stream))
         .route("/{info_hash}/create", any(create_magnet))
         .route("/{info_hash}/stats.json", get(torrent_stats))
         .route("/{info_hash}/remove", get(remove_torrent))
@@ -945,6 +965,8 @@ include!("runtime/proxy.rs");
 include!("runtime/opensub.rs");
 
 include!("runtime/subtitles.rs");
+
+include!("runtime/downloader.rs");
 
 include!("runtime/torrent_http.rs");
 

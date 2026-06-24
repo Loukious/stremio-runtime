@@ -1,10 +1,71 @@
+use easy_ffprobe::{FfProbe, Format, StreamKinds, ffprobe};
+
 static STREAM_REQUEST_ID: std::sync::atomic::AtomicU64 =
     std::sync::atomic::AtomicU64::new(1);
 
-async fn probe() -> Json<Value> {
+async fn probe(RawQuery(raw_query): RawQuery) -> Json<Value> {
+    let Some(url) = query_first(raw_query.as_deref(), "url") else {
+        return Json(json!({
+            "error": "Missing query parameter: 'url'",
+            "result": null
+        }))
+    };
+    let probe = match ffprobe(url) {
+        Ok(probe) => probe,
+        Err(err) => return Json(json!({
+                "error": err.to_string()
+            })),
+    };
+
+    let FfProbe { streams, format, .. } = probe;
+    let Format { format_name, duration, bit_rate, .. } = format;
+
+    let streams: Vec<_> = streams.into_iter().filter_map(|stream| {
+        let (ty, name, bitrate, tags, vid) = match &stream.stream {
+            StreamKinds::Video(vid) => (
+                "video",
+                &vid.codec_name,
+                vid.bit_rate.unwrap_or(0),
+                vid.tags.as_ref().map(|t| &t.tags),
+                Some(vid),
+            ),
+            StreamKinds::Audio(ad) => (
+                "audio",
+                &ad.codec_name,
+                ad.bit_rate.unwrap_or(0),
+                ad.tags.as_ref().map(|t| &t.tags),
+                None
+            ),
+            _ => return None
+        };
+        let fr = stream.r_frame_rate;
+        let fps = if fr.denominator() != 0 {
+            Some(fr.numerator() as f32 / fr.denominator() as f32)
+        } else { None };
+        Some(json!({
+            "codec_type": ty,
+            "codec_name": name,
+            "stream": stream.index,
+            "bitrate": bitrate,
+            "default": stream.disposition.default,
+            "fps": fps,
+            "size": vid.map(|vid| [vid.width, vid.height]),
+            "lang": tags.and_then(|t| t.language.as_ref()),
+        }))
+    }).collect();
+
+    let container = if format_name.contains("mp4") {
+        "mp4"
+    } else if format_name.contains("matroska") {
+        "matroska"
+    } else {
+        &format_name
+    };
     Json(json!({
-        "error": null,
-        "result": null
+        "container": container,
+        "duration": duration.map(|d| d.as_secs()),
+        "bitrate": bit_rate,
+        "streams": streams,
     }))
 }
 

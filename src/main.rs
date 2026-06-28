@@ -27,7 +27,7 @@ use axum::{
     routing::{any, get},
 };
 use chrono::{SecondsFormat, Utc};
-use futures_util::{Stream, TryStreamExt};
+use futures_util::{Stream, StreamExt, TryStreamExt};
 use librqbit::{
     AddTorrent, AddTorrentOptions, ConnectionOptions, ListenerOptions, Magnet,
     PeerConnectionOptions, Session, SessionOptions, api::TorrentIdOrHash,
@@ -55,10 +55,11 @@ const STARTUP_NAME: &str = "stremio-service-rs";
 // Must be shorter than mpv/yt-dlp's 20 s read timeout so we can return a
 // proper 503 error before the client gives up and marks the whole URL broken.
 const STREAM_INIT_TIMEOUT: Duration = Duration::from_secs(14);
-// How long to wait for stream() to open and seek() to complete.
-// Both operations can block a tokio OS thread if pieces aren't on disk yet;
-// we time them out separately so the runtime stays responsive.
-const STREAM_OPEN_TIMEOUT: Duration = Duration::from_secs(10);
+// How long to wait for stream(), seek(), and the first readable bytes.
+// Cold torrents can legitimately need longer than mpv/yt-dlp's default
+// webpage timeout, so keep the HTTP request alive instead of turning normal
+// buffering into repeated 503/open-failed cycles.
+const STREAM_OPEN_TIMEOUT: Duration = Duration::from_secs(60);
 const CREATE_METADATA_GRACE: Duration = Duration::from_millis(1500);
 const MULTI_USER_ENGINE_INACTIVITY_TIMEOUT: Duration = Duration::from_secs(2 * 60);
 const ENGINE_CLEANUP_INTERVAL: Duration = Duration::from_secs(1);

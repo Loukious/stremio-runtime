@@ -42,6 +42,10 @@ This is meant to be used with my [Stremio fork](https://github.com/Loukious/stre
 but can also be used with the original shell. To use it, build this project in release mode
 or download a release binary, name it `stremio-runtime.exe`, and replace the original runtime.
 
+By default the runtime starts in single-user mode and cleans up inactive torrents immediately
+when the stream is no longer needed. Pass `--multi-user` to keep torrents around longer for
+shared-machine setups where another user may still want the same stream or torrent data.
+
 ---
 
 ## Stremio Service Endpoint Map

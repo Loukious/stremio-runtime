@@ -573,6 +573,82 @@ async fn stream_common(
             .context("building HEAD response")?);
     }
 
+    let first_read_len = body_len.min(64 * 1024) as usize;
+    let mut first_read_buf = vec![0; first_read_len];
+    info!(
+        request_id,
+        info_hash,
+        file_idx,
+        start,
+        first_read_len,
+        elapsed_ms = t0.elapsed().as_millis(),
+        "[TIMING] waiting for first stream bytes before response"
+    );
+    let first_read = match timeout(STREAM_OPEN_TIMEOUT, stream.read(&mut first_read_buf)).await {
+        Ok(Ok(0)) => {
+            warn!(
+                request_id,
+                info_hash,
+                file_idx,
+                start,
+                elapsed_ms = t0.elapsed().as_millis(),
+                "[TIMING] stream ended before first requested byte"
+            );
+            return Ok((
+                StatusCode::SERVICE_UNAVAILABLE,
+                [("Retry-After", "2")],
+                "waiting for torrent pieces",
+            )
+                .into_response());
+        }
+        Ok(Ok(n)) => {
+            info!(
+                request_id,
+                info_hash,
+                file_idx,
+                start,
+                first_read_bytes = n,
+                elapsed_ms = t0.elapsed().as_millis(),
+                "[TIMING] first stream bytes ready"
+            );
+            n
+        }
+        Ok(Err(err)) => {
+            warn!(
+                request_id,
+                info_hash,
+                file_idx,
+                start,
+                elapsed_ms = t0.elapsed().as_millis(),
+                "[TIMING] first stream read failed: {err:#}"
+            );
+            return Ok((
+                StatusCode::SERVICE_UNAVAILABLE,
+                [("Retry-After", "2")],
+                "reading torrent stream failed",
+            )
+                .into_response());
+        }
+        Err(_elapsed) => {
+            warn!(
+                request_id,
+                info_hash,
+                file_idx,
+                start,
+                elapsed_ms = t0.elapsed().as_millis(),
+                "[TIMING] first stream bytes timed out"
+            );
+            return Ok((
+                StatusCode::SERVICE_UNAVAILABLE,
+                [("Retry-After", "2")],
+                "waiting for torrent pieces",
+            )
+                .into_response());
+        }
+    };
+
+    first_read_buf.truncate(first_read);
+
     state.torrents.stream_started(&normalized_info_hash).await;
     info!(
         request_id,
@@ -592,9 +668,14 @@ async fn stream_common(
         });
     };
 
-    let inner = ReaderStream::with_capacity(stream.take(body_len), 512 * 1024);
+    let remaining_len = body_len.saturating_sub(first_read as u64);
+    let first_chunk = Bytes::from(first_read_buf);
+    let first_chunk_stream =
+        futures_util::stream::once(async move { Ok::<Bytes, std::io::Error>(first_chunk) });
+    let remaining_stream = ReaderStream::with_capacity(stream.take(remaining_len), 512 * 1024);
+    let inner: BoxByteStream = Box::pin(first_chunk_stream.chain(remaining_stream));
     let body_stream = WindowTrackingStream {
-        inner: Box::pin(inner),
+        inner,
         on_drop: Some(Box::new(on_drop)),
         handle: handle.clone(),
         file_idx,

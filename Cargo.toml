@@ -8,6 +8,7 @@ anyhow = "1"
 axum = { version = "0.8", features = ["macros", "json"] }
 bytes = "1"
 chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
+easy-ffprobe = { version = "0.5.6", git = "https://github.com/saulvaldelvira/ffprobe-rs", default-features = false, features = ["format", "streams"]}
 futures-util = "0.3"
 http = "1"
 librqbit = { version = "9.0.0-beta.2", default-features = false, features = ["default-tls"], git = "https://github.com/Loukious/rqbit", branch = "main" }

@@ -124,6 +124,10 @@ jobs:
         with:
           ref: ${{ needs.prepare.outputs.ref }}
           persist-credentials: false
+      - name: Trust the checked-out Linux workspace
+        if: startsWith(matrix.platform, 'linux-')
+        shell: bash
+        run: git config --global --add safe.directory "$GITHUB_WORKSPACE"
       - uses: actions/setup-python@v6
         if: "!startsWith(matrix.platform, 'linux-')"
         with:

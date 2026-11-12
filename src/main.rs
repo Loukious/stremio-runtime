@@ -29,8 +29,8 @@ use axum::{
 use chrono::{SecondsFormat, Utc};
 use futures_util::{Stream, StreamExt, TryStreamExt};
 use librqbit::{
-    AddTorrent, AddTorrentOptions, ConnectionOptions, ListenerOptions, Magnet,
-    PeerConnectionOptions, Session, SessionOptions, api::TorrentIdOrHash, dht::PersistentDhtConfig,
+    AddTorrent, AddTorrentOptions, ConnectionOptions, DhtSessionConfig, ListenerOptions, Magnet,
+    PeerConnectionOptions, Session, SessionOptions, api::TorrentIdOrHash,
 };
 use librqbit_core::torrent_metainfo::torrent_from_bytes;
 use percent_encoding::{AsciiSet, CONTROLS, percent_decode_str, utf8_percent_encode};
@@ -518,6 +518,7 @@ async fn main() -> anyhow::Result<()> {
                     connect_timeout: Some(Duration::from_secs(8)),
                     read_write_timeout: Some(Duration::from_secs(30)),
                     keep_alive_interval: Some(Duration::from_secs(60)),
+                    ..Default::default()
                 }),
                 ..Default::default()
             }),
@@ -533,7 +534,7 @@ async fn main() -> anyhow::Result<()> {
             runtime_worker_threads: Some(4),
             // Keep the persisted routing table, but never reuse its UDP port. Windows can reserve
             // a previously valid dynamic port between launches, which otherwise aborts startup.
-            dht_config: Some(PersistentDhtConfig {
+            dht: Some(DhtSessionConfig {
                 port: Some(0),
                 ..Default::default()
             }),
@@ -597,16 +598,7 @@ async fn main() -> anyhow::Result<()> {
         .timeout(Duration::from_secs(90))
         .build()
         .context("building HTTP client")?;
-    let proxy_client = reqwest::Client::builder()
-        .user_agent("stremio-service-rs/0.1")
-        .http1_only()
-        .redirect(reqwest::redirect::Policy::none())
-        .danger_accept_invalid_certs(true)
-        .danger_accept_invalid_hostnames(true)
-        .connect_timeout(Duration::from_secs(15))
-        .timeout(Duration::from_secs(90))
-        .build()
-        .context("building proxy HTTP client")?;
+    let proxy_client = build_proxy_http_client()?;
     let download_client = reqwest::Client::builder()
         .user_agent("stremio-service-rs/0.1")
         .http1_only()
@@ -1170,7 +1162,7 @@ mod tests {
         let session = Session::new_with_opts(
             initial_cache.clone(),
             SessionOptions {
-                disable_dht: true,
+                dht: None,
                 disable_trackers: true,
                 disable_local_service_discovery: true,
                 ..Default::default()

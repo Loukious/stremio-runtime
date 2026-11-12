@@ -975,6 +975,7 @@ Response headers copied back:
 
 - `accept-ranges`
 - `content-type`
+- `content-encoding` (when not removed by automatic upstream decompression)
 - `content-length`
 - `content-range`
 - `connection`
@@ -988,12 +989,20 @@ Behavior:
 
 - Follows up to 5 redirects.
 - Uses a proxy-specific HTTP client with automatic redirects disabled and invalid TLS certificates/hostnames accepted, matching the legacy proxy behavior.
+- Connects within 15 seconds and waits up to 90 seconds for each upstream response's
+  headers. Media bodies have no total request deadline, so long playback can remain
+  connected beyond 90 seconds. Stream failures propagate as body errors.
 - For `.m3u`, `.m3u8`, or MPEGURL content, removes `content-length`, sets
   `accept-ranges: none`, ensures chunked transfer, and rewrites playlist URLs through `/proxy`.
+  Reading the buffered playlist body has a separate 90-second deadline.
 
 Response:
 
 - Upstream status and body, possibly rewritten for playlists.
+- `504` if upstream response headers or a buffered playlist body exceed their deadline.
+
+See [HTTP playback interruption investigation](docs/http-stream-interruptions.md)
+for the distinction between direct CDN playback and runtime proxy playback.
 
 ## Local Addon Routes
 

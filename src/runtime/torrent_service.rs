@@ -1,4 +1,43 @@
 impl TorrentService {
+    async fn output_folder(&self, handle: &Arc<librqbit::ManagedTorrent>) -> PathBuf {
+        self.output_folders
+            .read()
+            .await
+            .get(&handle.info_hash().as_string())
+            .cloned()
+            .unwrap_or_else(|| self.cache_dir.join(handle.info_hash().as_string()))
+    }
+
+    async fn reserve_output_folder(&self, hash: &str, folder: PathBuf) -> PathBuf {
+        self.output_folders
+            .write()
+            .await
+            .entry(hash.to_owned())
+            .or_insert(folder)
+            .clone()
+    }
+
+    async fn current_cache_dir(&self) -> PathBuf {
+        let values = self.settings.values.read().await;
+        let cache = cache_dir_from_settings(&values);
+        let cache = tokio::fs::canonicalize(&cache).await.unwrap_or(cache);
+        let mut known = self.known_cache_dirs.write().await;
+        known.insert(cache.clone());
+        if let Some(roots) = values.get("cacheRootsToClean").and_then(Value::as_array) {
+            for root in roots
+                .iter()
+                .filter_map(Value::as_str)
+                .map(Path::new)
+                .filter(|root| root.is_absolute())
+            {
+                if let Ok(cache) = tokio::fs::canonicalize(root.join("stremio-cache")).await {
+                    known.insert(cache);
+                }
+            }
+        }
+        cache
+    }
+
     async fn add_magnet(
         &self,
         info_hash: &str,
@@ -19,13 +58,16 @@ impl TorrentService {
         initial_peers.extend(parse_peer_addrs(&request.initial_peers));
         initial_peers.extend(parse_peer_addrs(&request.peers));
 
-        let default_output_folder = self.cache_dir.join(&info_hash);
+        let default_output_folder = self.current_cache_dir().await.join(&info_hash);
         let output_folder = request
             .path
             .as_ref()
             .filter(|p| !p.trim().is_empty())
             .cloned()
             .or_else(|| Some(default_output_folder.to_string_lossy().into_owned()));
+        let output_folder = self
+            .reserve_output_folder(&info_hash, PathBuf::from(output_folder.unwrap()))
+            .await;
 
         if let Some(connections) = request.connections {
             debug!(
@@ -43,7 +85,7 @@ impl TorrentService {
                 AddTorrent::from_url(magnet.to_string()),
                 Some(AddTorrentOptions {
                     overwrite: true,
-                    output_folder,
+                    output_folder: Some(output_folder.to_string_lossy().into_owned()),
                     peer_opts: Some(PeerConnectionOptions {
                         connect_timeout: Some(Duration::from_secs(8)),
                         read_write_timeout: Some(Duration::from_secs(30)),
@@ -64,9 +106,21 @@ impl TorrentService {
                 }),
             )
             .await
-            .context("adding magnet to librqbit")?
-            .into_handle()
-            .context("torrent was not started")?;
+            .context("adding magnet to librqbit")
+            .and_then(|result| result.into_handle().context("torrent was not started"));
+        let handle = match handle {
+            Ok(handle) => handle,
+            Err(err) => {
+                if self
+                    .session
+                    .get(TorrentIdOrHash::parse(&info_hash)?)
+                    .is_none()
+                {
+                    self.output_folders.write().await.remove(&info_hash);
+                }
+                return Err(err.into());
+            }
+        };
 
         let ih = handle.info_hash().as_string();
         self.handles
@@ -142,7 +196,11 @@ impl TorrentService {
                 {
                     warn!(info_hash = %pending_info_hash, error = %err.0, "background magnet resolution failed");
                 }
-                service.pending_magnets.write().await.remove(&pending_info_hash);
+                service
+                    .pending_magnets
+                    .write()
+                    .await
+                    .remove(&pending_info_hash);
             });
         }
 
@@ -174,21 +232,39 @@ impl TorrentService {
     }
 
     async fn add_torrent_bytes(&self, bytes: Bytes) -> AppResult<Arc<librqbit::ManagedTorrent>> {
+        let info_hash = torrent_from_bytes(&bytes)
+            .context("parsing torrent file")?
+            .info_hash
+            .as_string();
+        let output_folder = self.current_cache_dir().await.join(&info_hash);
+        let output_folder = self.reserve_output_folder(&info_hash, output_folder).await;
         let handle = self
             .session
             .add_torrent(
                 AddTorrent::from_bytes(bytes),
                 Some(AddTorrentOptions {
                     overwrite: true,
-                    output_folder: Some(self.cache_dir.to_string_lossy().into_owned()),
+                    output_folder: Some(output_folder.to_string_lossy().into_owned()),
                     trackers: Some(merge_trackers(std::iter::empty())),
                     ..Default::default()
                 }),
             )
             .await
-            .context("adding torrent file to librqbit")?
-            .into_handle()
-            .context("torrent was not started")?;
+            .context("adding torrent file to librqbit")
+            .and_then(|result| result.into_handle().context("torrent was not started"));
+        let handle = match handle {
+            Ok(handle) => handle,
+            Err(err) => {
+                if self
+                    .session
+                    .get(TorrentIdOrHash::parse(&info_hash)?)
+                    .is_none()
+                {
+                    self.output_folders.write().await.remove(&info_hash);
+                }
+                return Err(err.into());
+            }
+        };
         let ih = handle.info_hash().as_string();
         self.handles
             .write()
@@ -216,6 +292,7 @@ impl TorrentService {
             .await
             .retain(|_, hash| hash != &info_hash);
         self.torrent_owners.write().await.remove(&info_hash);
+        self.output_folders.write().await.remove(&info_hash);
         self.session
             .delete(TorrentIdOrHash::parse(&info_hash)?, false)
             .await
@@ -438,18 +515,22 @@ impl TorrentService {
         };
 
         let active_hashes = self.active_cache_keys().await;
-        let (mut total, mut candidates) = match collect_cache_entries(
-            &self.cache_dir,
-            &active_hashes,
-        )
-        .await
-        {
-            Ok(entries) => entries,
-            Err(err) => {
-                warn!(cache_dir = %self.cache_dir.display(), error = %err, "cache reaper scan failed");
-                return;
+        self.current_cache_dir().await;
+        let roots = self.known_cache_dirs.read().await.clone();
+        let mut total = 0u64;
+        let mut candidates = Vec::new();
+        for cache_dir in roots {
+            match collect_cache_entries(&cache_dir, &active_hashes).await {
+                Ok((size, entries)) => {
+                    total = total.saturating_add(size);
+                    candidates.extend(entries);
+                }
+                Err(err) => {
+                    warn!(cache_dir = %cache_dir.display(), error = %err, "cache reaper scan failed");
+                    return;
+                }
             }
-        };
+        }
 
         if total <= limit {
             debug!(
@@ -480,8 +561,13 @@ impl TorrentService {
                 break;
             }
 
-            match remove_cache_entry(&entry, &self.cache_dir).await {
+            let Some(cache_dir) = entry.path.parent() else {
+                continue;
+            };
+            match remove_cache_entry(&entry, cache_dir).await {
                 Ok(()) => {
+                    // The session keeps its bitfields in the initial root until restart.
+                    remove_fastresume_for_cache_key(&self.cache_dir, &entry.key).await;
                     total = total.saturating_sub(entry.size);
                     info!(
                         key = %entry.key,
@@ -554,18 +640,18 @@ impl TorrentService {
                 continue;
             }
 
-            let Some(freed) = remove_unselected_torrent_files(
-                &self.cache_dir,
-                &hash,
-                handle,
-                &selected,
-            )
-            .await?
+            let output_folder = self.output_folder(handle).await;
+            let Some(cache_dir) = output_folder.parent() else {
+                continue;
+            };
+            let Some(freed) =
+                remove_unselected_torrent_files(cache_dir, &hash, handle, &selected).await?
             else {
                 continue;
             };
 
             total = total.saturating_sub(freed);
+            remove_fastresume_for_cache_key(&self.cache_dir, &hash).await;
             info!(
                 info_hash = %hash,
                 freed,
@@ -587,6 +673,7 @@ impl TorrentService {
             .cloned()
             .collect::<HashSet<_>>();
         active.extend(self.active_streams.read().await.keys().cloned());
+        active.extend(self.output_folders.read().await.keys().cloned());
         active
     }
 }
@@ -597,6 +684,13 @@ async fn collect_cache_entries(
 ) -> anyhow::Result<(u64, Vec<CacheEntry>)> {
     let mut total = 0u64;
     let mut candidates = Vec::new();
+
+    if let Ok(metadata) = tokio::fs::symlink_metadata(cache_dir).await {
+        anyhow::ensure!(
+            !metadata.file_type().is_symlink(),
+            "Cache directory is a symbolic link."
+        );
+    }
 
     let mut entries = match tokio::fs::read_dir(cache_dir).await {
         Ok(entries) => entries,
@@ -787,7 +881,8 @@ async fn remove_unselected_torrent_files(
                 Ok(parent) => parent,
                 Err(err) if err.kind() == std::io::ErrorKind::NotFound => continue,
                 Err(err) => {
-                    return Err(err).with_context(|| format!("canonicalizing {}", parent.display()));
+                    return Err(err)
+                        .with_context(|| format!("canonicalizing {}", parent.display()));
                 }
             },
             None => continue,
@@ -867,7 +962,7 @@ async fn prune_empty_dirs(root: &Path, canonical_root: &Path) {
 
 fn stats_for_handle(
     handle: &Arc<librqbit::ManagedTorrent>,
-    cache_dir: &Path,
+    output_folder: &Path,
     stream_idx: Option<usize>,
     guessed_idx: Option<usize>,
 ) -> Value {
@@ -985,7 +1080,7 @@ fn stats_for_handle(
         upload_speed: download_speed.max(upload_speed),
         sources: official_sources(&source_urls, unique_peers.min(400) as usize),
         peer_search_running: !stats.finished,
-        opts: official_stats_opts(&source_urls, &info_hash, cache_dir),
+        opts: official_stats_opts(&source_urls, output_folder),
         state: stats.state.to_string(),
         error: stats.error,
         finished: None,
@@ -1060,8 +1155,8 @@ fn official_sources(source_urls: &[String], discovered_peers: usize) -> Value {
     )
 }
 
-fn official_stats_opts(source_urls: &[String], info_hash: &str, cache_dir: &Path) -> Value {
-    let path = cache_dir.join(info_hash).to_string_lossy().to_string();
+fn official_stats_opts(source_urls: &[String], output_folder: &Path) -> Value {
+    let path = output_folder.to_string_lossy().to_string();
     json!({
         "peerSearch": {
             "min": 40,
@@ -1320,7 +1415,11 @@ fn normalize_playback_owner(input: &str) -> Option<String> {
     Some(owner.to_string())
 }
 
-fn playback_owner(header: Option<&str>, real_ip_header: Option<&str>, peer_addr: SocketAddr) -> String {
+fn playback_owner(
+    header: Option<&str>,
+    real_ip_header: Option<&str>,
+    peer_addr: SocketAddr,
+) -> String {
     header
         .and_then(normalize_playback_owner)
         .unwrap_or_else(|| {

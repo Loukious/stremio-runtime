@@ -159,6 +159,9 @@ struct TorrentService {
     owner_torrents: RwLock<HashMap<String, String>>,
     torrent_owners: RwLock<HashMap<String, HashSet<String>>>,
     cache_dir: PathBuf,
+    settings: Arc<SettingsStore>,
+    known_cache_dirs: RwLock<HashSet<PathBuf>>,
+    output_folders: RwLock<HashMap<String, PathBuf>>,
 }
 
 #[derive(Debug)]
@@ -496,6 +499,9 @@ async fn main() -> anyhow::Result<()> {
     tokio::fs::create_dir_all(&cache_dir)
         .await
         .with_context(|| format!("creating cache dir {}", cache_dir.display()))?;
+    let cache_dir = tokio::fs::canonicalize(cache_dir)
+        .await
+        .context("resolving cache directory")?;
 
     let trackers = default_tracker_urls();
 
@@ -548,7 +554,10 @@ async fn main() -> anyhow::Result<()> {
         selected_files: RwLock::new(HashMap::new()),
         owner_torrents: RwLock::new(HashMap::new()),
         torrent_owners: RwLock::new(HashMap::new()),
+        known_cache_dirs: RwLock::new(HashSet::from([cache_dir.clone()])),
         cache_dir,
+        settings: settings.clone(),
+        output_folders: RwLock::new(HashMap::new()),
     });
 
     {
@@ -994,6 +1003,254 @@ include!("runtime/torrent_service.rs");
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn settings_test_dir() -> PathBuf {
+        let path = std::env::temp_dir().join(format!(
+            "stremio-settings-test-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(SystemTime::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir(&path).unwrap();
+        path
+    }
+
+    fn remove_settings_test_dir(path: &Path) {
+        assert!(path.is_absolute() && path.parent() == Some(std::env::temp_dir().as_path()));
+        assert!(
+            path.file_name()
+                .unwrap()
+                .to_string_lossy()
+                .starts_with("stremio-settings-test-")
+        );
+        std::fs::remove_dir_all(path).unwrap();
+    }
+
+    #[tokio::test]
+    async fn settings_updates_are_serialized_and_survive_reload() {
+        let dir = settings_test_dir();
+        let store = SettingsStore {
+            path: dir.join("settings.json"),
+            values: RwLock::new(default_settings_values(&dir)),
+        };
+        store.save().await.unwrap();
+        let first = store.update(Map::from_iter([("cacheSize".into(), json!(512))]), &dir);
+        let second = store.update(
+            Map::from_iter([("localAddonEnabled".into(), json!(true))]),
+            &dir,
+        );
+        let (first, second) = tokio::join!(first, second);
+        first.unwrap();
+        second.unwrap();
+        let restored: Value = serde_json::from_slice(&std::fs::read(&store.path).unwrap()).unwrap();
+        assert_eq!(restored["cacheSize"], 512);
+        assert_eq!(restored["localAddonEnabled"], true);
+        assert_eq!(restored["serverVersion"], env!("CARGO_PKG_VERSION"));
+        assert_eq!(std::fs::read_dir(&dir).unwrap().count(), 1);
+        remove_settings_test_dir(&dir);
+    }
+
+    #[tokio::test]
+    #[cfg(windows)]
+    async fn failed_settings_write_preserves_disk_and_active_values() {
+        let dir = settings_test_dir();
+        let store = SettingsStore {
+            path: dir.join("settings.json"),
+            values: RwLock::new(default_settings_values(&dir)),
+        };
+        store.save().await.unwrap();
+        let before = std::fs::read(&store.path).unwrap();
+        let mut permissions = std::fs::metadata(&store.path).unwrap().permissions();
+        permissions.set_readonly(true);
+        std::fs::set_permissions(&store.path, permissions).unwrap();
+        let result = store
+            .update(Map::from_iter([("cacheSize".into(), json!(512))]), &dir)
+            .await;
+        let mut permissions = std::fs::metadata(&store.path).unwrap().permissions();
+        permissions.set_readonly(false);
+        std::fs::set_permissions(&store.path, permissions).unwrap();
+        assert_eq!(result.unwrap_err().0, StatusCode::INTERNAL_SERVER_ERROR);
+        assert_eq!(std::fs::read(&store.path).unwrap(), before);
+        assert_eq!(store.values.read().await["cacheSize"], 2147483648u64);
+        assert_eq!(std::fs::read_dir(&dir).unwrap().count(), 1);
+        remove_settings_test_dir(&dir);
+    }
+
+    #[tokio::test]
+    async fn cache_root_update_validates_folder_and_tracks_previous_root() {
+        let dir = settings_test_dir();
+        let new_root = dir.join("new-cache");
+        std::fs::create_dir(&new_root).unwrap();
+        let store = SettingsStore {
+            path: dir.join("settings.json"),
+            values: RwLock::new(default_settings_values(&dir)),
+        };
+        let invalid = store
+            .update(
+                Map::from_iter([("cacheRoot".into(), json!("relative-folder"))]),
+                &dir,
+            )
+            .await;
+        assert_eq!(invalid.unwrap_err().0, StatusCode::BAD_REQUEST);
+        assert!(!store.path.exists());
+        store
+            .update(
+                Map::from_iter([("cacheRoot".into(), json!(new_root))]),
+                &dir,
+            )
+            .await
+            .unwrap();
+        let values = store.values.read().await;
+        assert_eq!(
+            cache_dir_from_settings(&values),
+            std::fs::canonicalize(&new_root)
+                .unwrap()
+                .join("stremio-cache")
+        );
+        assert_eq!(values["cacheRootsToClean"], json!([dir]));
+        assert!(new_root.join("stremio-cache").is_dir());
+        drop(values);
+        remove_settings_test_dir(&dir);
+    }
+
+    #[test]
+    fn proxy_response_headers_protect_untrusted_html_after_overrides() {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            CONTENT_TYPE,
+            HeaderValue::from_static("text/html; charset=utf-8"),
+        );
+        headers.insert(
+            "content-security-policy",
+            HeaderValue::from_static("default-src *"),
+        );
+        proxy_protect_response(
+            &mut headers,
+            &url::Url::parse("https://app.strem.io.attacker.test/page").unwrap(),
+        );
+        assert_eq!(headers["content-security-policy"], "sandbox");
+        assert_eq!(headers[CONTENT_DISPOSITION], "attachment");
+        assert_eq!(headers[CACHE_CONTROL], "no-cache");
+        assert_eq!(headers["x-content-type-options"], "nosniff");
+        let mut trusted = HeaderMap::new();
+        trusted.insert(CONTENT_TYPE, HeaderValue::from_static("text/html"));
+        proxy_protect_response(
+            &mut trusted,
+            &url::Url::parse("https://app.strem.io/page").unwrap(),
+        );
+        assert!(!trusted.contains_key("content-security-policy"));
+        assert!(!trusted.contains_key(CONTENT_DISPOSITION));
+    }
+
+    #[test]
+    fn download_filenames_are_safe_and_keep_unicode_name() {
+        let header = download_disposition("日本語\"\\\r\nvideo.mkv");
+        let value = header.to_str().unwrap();
+        assert!(value.contains("filename*=UTF-8''%E6%97%A5"));
+        assert!(!value.contains('\r') && !value.contains('\n'));
+        assert!(!value.contains('\\'));
+    }
+
+    #[tokio::test]
+    async fn changing_cache_root_keeps_active_torrents_and_places_new_torrents_in_new_folder() {
+        let dir = settings_test_dir();
+        let new_root = dir.join("new-root");
+        std::fs::create_dir(&new_root).unwrap();
+        let initial_cache = dir.join("stremio-cache");
+        std::fs::create_dir(&initial_cache).unwrap();
+        let settings = Arc::new(SettingsStore {
+            path: dir.join("settings.json"),
+            values: RwLock::new(default_settings_values(&dir)),
+        });
+        let session = Session::new_with_opts(
+            initial_cache.clone(),
+            SessionOptions {
+                disable_dht: true,
+                disable_trackers: true,
+                disable_local_service_discovery: true,
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+        let service = TorrentService {
+            session,
+            multi_user: false,
+            handles: RwLock::new(HashMap::new()),
+            last_active: RwLock::new(HashMap::new()),
+            active_streams: RwLock::new(HashMap::new()),
+            pending_magnets: RwLock::new(HashSet::new()),
+            selected_files: RwLock::new(HashMap::new()),
+            owner_torrents: RwLock::new(HashMap::new()),
+            torrent_owners: RwLock::new(HashMap::new()),
+            cache_dir: std::fs::canonicalize(&initial_cache).unwrap(),
+            settings: settings.clone(),
+            known_cache_dirs: RwLock::new(HashSet::new()),
+            output_folders: RwLock::new(HashMap::new()),
+        };
+        fn torrent(name: &str) -> Bytes {
+            let mut bytes = format!(
+                "d4:infod6:lengthi1e4:name{}:{name}12:piece lengthi16384e6:pieces20:",
+                name.len()
+            )
+            .into_bytes();
+            bytes.extend_from_slice(
+                &decode_hex("11f6ad8ec52a2984abaafd7c3b516503785c2072").unwrap(),
+            );
+            bytes.extend_from_slice(b"ee");
+            bytes.into()
+        }
+        let first = torrent("a.mkv");
+        let first_hash = torrent_from_bytes(&first).unwrap().info_hash.as_string();
+        let first_dir = initial_cache.join(&first_hash);
+        std::fs::create_dir(&first_dir).unwrap();
+        std::fs::write(first_dir.join("a.mkv"), b"x").unwrap();
+        let first = service.add_torrent_bytes(first).await.unwrap();
+        first.wait_until_initialized().await.unwrap();
+        settings
+            .update(
+                Map::from_iter([
+                    ("cacheRoot".into(), json!(new_root)),
+                    ("cacheSize".into(), json!(0)),
+                ]),
+                &dir,
+            )
+            .await
+            .unwrap();
+        let second = torrent("b.mkv");
+        let second_hash = torrent_from_bytes(&second).unwrap().info_hash.as_string();
+        let second_dir = new_root.join("stremio-cache").join(&second_hash);
+        std::fs::create_dir(&second_dir).unwrap();
+        std::fs::write(second_dir.join("b.mkv"), b"x").unwrap();
+        let second = service.add_torrent_bytes(second).await.unwrap();
+        second.wait_until_initialized().await.unwrap();
+        assert_eq!(
+            service.output_folder(&first).await,
+            std::fs::canonicalize(first_dir).unwrap()
+        );
+        assert_eq!(
+            service.output_folder(&second).await,
+            std::fs::canonicalize(second_dir).unwrap()
+        );
+        service.cleanup_cache_to_limit(&settings).await;
+        assert!(initial_cache.join(&first_hash).join("a.mkv").is_file());
+        assert!(
+            new_root
+                .join("stremio-cache")
+                .join(&second_hash)
+                .join("b.mkv")
+                .is_file()
+        );
+        service.remove(&first_hash).await.unwrap();
+        service.remove(&second_hash).await.unwrap();
+        service.session.stop().await;
+        drop(first);
+        drop(second);
+        drop(service);
+        remove_settings_test_dir(&dir);
+    }
 
     #[test]
     fn single_user_server_uses_loopback() {

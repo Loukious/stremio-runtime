@@ -693,7 +693,7 @@ fn router(state: AppState) -> Router {
         .route("/opensubHash", get(opensub_hash))
         .route("/subtitlesTracks", get(subtitles_tracks))
         .route("/subtitles.{ext}", get(subtitles_proxy))
-        .route("/probe", any(probe))
+        .route("/probe", get(media_probe::probe))
         .route("/hlsv2/probe", any(probe))
         .route("/stats.json", get(global_stats))
         .route("/removeAll", get(remove_all))
@@ -995,6 +995,9 @@ include!("runtime/opensub.rs");
 include!("runtime/subtitles.rs");
 
 include!("runtime/downloader.rs");
+
+#[path = "runtime/probe.rs"]
+mod media_probe;
 
 include!("runtime/torrent_http.rs");
 

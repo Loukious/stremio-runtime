@@ -64,6 +64,18 @@ def architecture(path):
         raise RuntimeError(f"Unsupported executable format: {path}")
 
 
+def macos_deployment_versions(load_commands):
+    versions = []
+    for block in re.split(r"^Load command \d+\s*$", load_commands, flags=re.MULTILINE):
+        command = re.search(r"^\s*cmd\s+(LC_BUILD_VERSION|LC_VERSION_MIN_MACOSX)\s*$", block, re.MULTILINE)
+        if command:
+            key = "minos" if command[1] == "LC_BUILD_VERSION" else "version"
+            version = re.search(rf"^\s*{key}\s+(\d+\.\d+(?:\.\d+)?)\s*$", block, re.MULTILINE)
+            if version:
+                versions.append(version[1])
+    return versions
+
+
 def dependencies(executable, operating_system):
     if operating_system == "windows":
         listing = run(["dumpbin", "/nologo", "/dependents", executable])
@@ -84,7 +96,9 @@ def dependencies(executable, operating_system):
             if not name.startswith(("/usr/lib/", "/System/Library/")):
                 raise RuntimeError(f"Unbundled macOS dependency: {name}")
         load_commands = run(["otool", "-l", executable])
-        versions = re.findall(r"^\s+(?:minos|version)\s+(\d+\.\d+(?:\.\d+)?)\s*$", load_commands, re.MULTILINE)
+        versions = macos_deployment_versions(load_commands)
+        if not versions:
+            raise RuntimeError(f"Could not inspect the macOS deployment target: {executable}")
         if any(tuple(map(int, version.split("."))) > (13, 0, 0) for version in versions):
             raise RuntimeError(f"Executable requires macOS newer than 13: {versions}")
         return {"imports": names, "minimum_macos": versions}
@@ -171,7 +185,7 @@ def runtime_smoke(runtime, media, temporary):
         if request_json(base + "/heartbeat").get("success") is not True:
             raise RuntimeError("Runtime heartbeat did not succeed")
         expected_version = tomllib.loads((REPOSITORY / "Cargo.toml").read_text())["package"]["version"]
-        actual_version = request_json(base + "/settings").get("serverVersion")
+        actual_version = request_json(base + "/settings").get("values", {}).get("serverVersion")
         if actual_version != expected_version:
             raise RuntimeError(f"Packaged runtime version mismatch: expected {expected_version}, got {actual_version}")
         probe = request_json(base + "/probe?" + urllib.parse.urlencode({"url": media_url}))

@@ -56,8 +56,16 @@ preserves both active torrents.
 
 A Windows x64 release build passed. Its runtime executable has SHA-256
 `0851E50246F656601A0995D374EB017197029556083ED8613911A2E7BC78E295`.
-The ARM64 release build compiled its Rust dependencies and runtime code but failed
-at the final link because the installed Visual Studio toolchains lack the ARM64
-MSVC linker/libraries. No replacement ARM64 binary was produced.
+The ARM64 release build also passed. Its runtime executable has SHA-256
+`072C7428C9EDBFAC4F65FB9E8425262C484488C0BE578279A808C3E1663169FD`.
+The installed Visual Studio toolchains lacked ARM64 CRT libraries. Instead of
+modifying the system installation, the required Microsoft ARM64 CRT desktop and
+shared import-library payloads were downloaded from the installed VS catalog,
+checked against their catalog SHA-256 hashes, and extracted into the task-owned
+`D:\Apps\stremio-arm64-builddeps` directory. The existing x64 linker was used
+with those ARM64 libraries and the installed Windows SDK's ARM64 libraries.
+The payload hashes are `c30a1064ef39efd3e969a1cac2bb56173de42aee558efbf7b5c1ca8910228687`
+and `904230c4a5c5d34b84c9c962f9435a8909cdaa2d0ebe3d0c55472de4e45db081`.
+ARM64 runtime execution was not tested on this x64 machine.
 These local checks do not establish device/network playback behavior or the
 unimplemented optional upstream server features.

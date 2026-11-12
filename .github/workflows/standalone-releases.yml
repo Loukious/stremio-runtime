@@ -26,7 +26,7 @@ permissions:
 
 concurrency:
   group: standalone-runtime-${{ github.ref }}-${{ inputs.tag }}
-  cancel-in-progress: false
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 env:
   RUST_VERSION: "1.99.1"
@@ -116,7 +116,7 @@ jobs:
         shell: bash
         run: |
           apt-get update
-          DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends build-essential binutils ca-certificates cmake curl git nasm ninja-build perl pkg-config xz-utils
+          DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends build-essential binutils ca-certificates cmake curl git nasm ninja-build perl pkg-config python3 python3-pip python-is-python3 xz-utils
       - name: Preserve shell script line endings on Windows
         if: startsWith(matrix.platform, 'windows-')
         run: git config --global core.autocrlf false
@@ -125,6 +125,7 @@ jobs:
           ref: ${{ needs.prepare.outputs.ref }}
           persist-credentials: false
       - uses: actions/setup-python@v6
+        if: "!startsWith(matrix.platform, 'linux-')"
         with:
           python-version: ${{ env.PYTHON_VERSION }}
       - uses: actions-rust-lang/setup-rust-toolchain@v1
@@ -159,7 +160,7 @@ jobs:
         run: brew install nasm ninja pkg-config
       - name: Install pinned Meson
         if: "!startsWith(matrix.platform, 'windows-')"
-        run: python -m pip install --disable-pip-version-check meson==1.10.0
+        run: python -m pip install --disable-pip-version-check meson==1.10.0 tomli==2.3.0
       - name: Fetch media sources and license payloads
         run: python scripts/prepare-ffmpeg.py --platform ${{ matrix.platform }} --output bundle
       - name: Build native Windows media tools

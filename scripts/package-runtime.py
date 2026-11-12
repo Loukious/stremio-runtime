@@ -18,13 +18,24 @@ import tarfile
 import tempfile
 import threading
 import time
-import tomllib
+try:
+    import tomllib
+except ModuleNotFoundError:
+    import tomli as tomllib
 import urllib.parse
 import urllib.request
 import zipfile
 
 
 REPOSITORY = Path(__file__).resolve().parent.parent
+
+
+def digest(path):
+    checksum = hashlib.sha256()
+    with path.open("rb") as source:
+        for chunk in iter(lambda: source.read(1024 * 1024), b""):
+            checksum.update(chunk)
+    return checksum.hexdigest()
 
 
 def run(command, timeout=120, cwd=None, env=None, stdout_only=False):
@@ -272,9 +283,7 @@ def main():
     checksum_lines = []
     for path in sorted(bundle.rglob("*")):
         if path.is_file() and path.name != "SHA256SUMS.txt":
-            with path.open("rb") as source:
-                digest = hashlib.file_digest(source, "sha256").hexdigest()
-            checksum_lines.append(f"{digest}  {path.relative_to(bundle).as_posix()}\n")
+            checksum_lines.append(f"{digest(path)}  {path.relative_to(bundle).as_posix()}\n")
     (bundle / "SHA256SUMS.txt").write_text("".join(checksum_lines), encoding="utf-8")
     args.output.mkdir(parents=True, exist_ok=True)
     name = f"stremio-runtime-{args.version}-{args.platform}"
@@ -288,10 +297,9 @@ def main():
         archive = args.output / (name + ".tar.gz")
         with tarfile.open(archive, "w:gz") as destination:
             destination.add(bundle, arcname=name)
-    with archive.open("rb") as source:
-        digest = hashlib.file_digest(source, "sha256").hexdigest()
-    archive.with_name(archive.name + ".sha256").write_text(f"{digest}  {archive.name}\n", encoding="utf-8")
-    print(f"Validated {args.platform}: {archive} (SHA-256 {digest})")
+    archive_digest = digest(archive)
+    archive.with_name(archive.name + ".sha256").write_text(f"{archive_digest}  {archive.name}\n", encoding="utf-8")
+    print(f"Validated {args.platform}: {archive} (SHA-256 {archive_digest})")
 
 
 if __name__ == "__main__":

@@ -68,7 +68,8 @@ The tag must match `Cargo.toml`, including any prerelease suffix. Publication us
 the workflow's GitHub token; extra secrets are unnecessary. Existing release
 assets are not silently overwritten.
 
-For a local source build, use Python 3.13+, Rust 1.99.1, a native C toolchain,
+For a local source build, use a security-patched Python 3.10+ (with `tomli==2.3.0`
+on Python 3.10), Rust 1.99.1, a native C toolchain,
 Make, Meson 1.10.0+, Ninja, NASM, Perl, pkg-config, and CMake on Linux. Windows media tools need
 MSYS2 CLANG64 or CLANGARM64; the Rust executable needs MSVC. macOS uses Xcode
 command-line tools. Linux uses a glibc-based build environment.

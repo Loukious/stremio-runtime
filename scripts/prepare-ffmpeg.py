@@ -15,8 +15,18 @@ PLATFORMS = ["windows-x64", "windows-arm64", "linux-x64", "linux-arm64", "macos-
 
 
 def digest(path):
+    checksum = hashlib.sha256()
     with path.open("rb") as source:
-        return hashlib.file_digest(source, "sha256").hexdigest()
+        for chunk in iter(lambda: source.read(1024 * 1024), b""):
+            checksum.update(chunk)
+    return checksum.hexdigest()
+
+
+def safe_extract(archive, destination):
+    if not hasattr(tarfile, "data_filter"):
+        raise RuntimeError("This Python lacks safe tar extraction filters. Install current Python security updates or Python 3.12+.")
+    with tarfile.open(archive) as source:
+        source.extractall(destination, filter="data")
 
 
 def download(url, checksum, destination):
@@ -53,8 +63,7 @@ def main():
             raise RuntimeError(f"Stale or unverified source cache at {directory}. Use a fresh --cache directory or remove this exact cache directory before rebuilding.")
         if not directory.exists():
             directory.mkdir(parents=True)
-            with tarfile.open(archive) as source:
-                source.extractall(directory, filter="data")
+            safe_extract(archive, directory)
             marker.write_text(json.dumps(expected_pin), encoding="utf-8")
         shutil.copy2(archive, payload / archive.name)
         roots = [path for path in directory.iterdir() if path.is_dir()]
@@ -81,8 +90,7 @@ def main():
         raise RuntimeError(f"Stale font cache at {font_source}. Use a fresh --cache directory before rebuilding.")
     if not font_source.exists():
         font_source.mkdir(parents=True)
-        with tarfile.open(font_archive) as source:
-            source.extractall(font_source, filter="data")
+        safe_extract(font_archive, font_source)
         font_marker.write_text(font_pin["sha256"], encoding="utf-8")
     font_root = next(path for path in font_source.iterdir() if path.is_dir())
     font_output = args.output / "fonts"

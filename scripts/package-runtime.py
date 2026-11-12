@@ -210,7 +210,7 @@ def verify_tools(bundle, platform, check_hls):
         if name not in protocols.split():
             raise RuntimeError(f"Required protocol unavailable: {name}")
     filters = run([ffmpeg, "-hide_banner", "-filters"])
-    if not re.search(r"^\s*[A-Z.]{3}\s+subtitles\s", filters, re.MULTILINE):
+    if not re.search(r"^\s*[A-Z.]+\s+subtitles\s", filters, re.MULTILINE):
         raise RuntimeError("Required libass subtitles filter is unavailable")
     if "noise" not in run([ffmpeg, "-hide_banner", "-bsfs"]).split():
         raise RuntimeError("Required H.264 copy boundary bitstream filter is unavailable")

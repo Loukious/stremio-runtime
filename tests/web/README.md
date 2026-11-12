@@ -22,6 +22,12 @@ Add `--copy-video` to generate H.264 with B-frames and verify that video is copi
 while six-channel PCM audio is converted to stereo AAC. The fixture checks the
 converter's reported copy mode in addition to decoding its output.
 
+Use `--adjacent-tools` with a complete standalone bundle to clear the runtime
+child's `PATH` and media/font overrides. This proves that probing, conversion,
+and subtitle burning find their tools and fonts beside the runtime executable.
+The fixture still uses explicit `--ffmpeg` and `--ffprobe` paths for its own
+media generation and output checks.
+
 For a browser check, first build the harness using the same player library as
 current Stremio Web, pinned to `@stremio/stremio-video` 0.0.103:
 

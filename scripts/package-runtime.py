@@ -145,6 +145,7 @@ def runtime_smoke(runtime, media, temporary):
     env = os.environ.copy()
     for name in ("STREMIO_FFMPEG_PATH", "STREMIO_FFPROBE_PATH"):
         env.pop(name, None)
+    env["PATH"] = ""
     env.update({"APP_PATH": str(temporary / "app"), "SETTINGS_PATH": str(temporary / "settings"), "STREMIO_SERVICE_CACHE": str(temporary / "cache"), "STREMIO_SERVICE_PORT": "0"})
     process = subprocess.Popen([str(runtime)], env=env, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, errors="replace")
     output = queue.Queue()
@@ -169,10 +170,14 @@ def runtime_smoke(runtime, media, temporary):
             raise RuntimeError("Runtime did not announce its HTTP endpoint: " + "".join(diagnostics[-20:]))
         if request_json(base + "/heartbeat").get("success") is not True:
             raise RuntimeError("Runtime heartbeat did not succeed")
+        expected_version = tomllib.loads((REPOSITORY / "Cargo.toml").read_text())["package"]["version"]
+        actual_version = request_json(base + "/settings").get("serverVersion")
+        if actual_version != expected_version:
+            raise RuntimeError(f"Packaged runtime version mismatch: expected {expected_version}, got {actual_version}")
         probe = request_json(base + "/probe?" + urllib.parse.urlencode({"url": media_url}))
         if probe.get("error") or not probe.get("streams"):
             raise RuntimeError(f"Runtime could not find/probe adjacent FFprobe: {probe}")
-        return {"heartbeat": True, "adjacent_ffprobe": True}
+        return {"heartbeat": True, "runtime_version": actual_version, "adjacent_ffprobe": True}
     finally:
         process.terminate()
         try:
@@ -242,10 +247,10 @@ def verify_tools(bundle, platform, check_hls):
         report["smoke"] = {"h264_aac_roundtrip": True, "ffmpeg_fmp4_hls": True, "ass_burn": True, **runtime_smoke(paths["stremio-runtime"], media, temporary)}
         if check_hls:
             verification = temporary / "web-hls-verification"
-            run([sys.executable, REPOSITORY / "scripts" / "verify-web-hls.py", "--runtime", paths["stremio-runtime"], "--ffmpeg", ffmpeg, "--ffprobe", ffprobe, "--output-dir", verification], timeout=300)
+            run([sys.executable, REPOSITORY / "scripts" / "verify-web-hls.py", "--runtime", paths["stremio-runtime"], "--ffmpeg", ffmpeg, "--ffprobe", ffprobe, "--output-dir", verification, "--adjacent-tools"], timeout=300)
             report["smoke"]["runtime_hls"] = json.loads((verification / "results.json").read_text())
             copied_verification = temporary / "web-hls-copy-verification"
-            run([sys.executable, REPOSITORY / "scripts" / "verify-web-hls.py", "--runtime", paths["stremio-runtime"], "--ffmpeg", ffmpeg, "--ffprobe", ffprobe, "--output-dir", copied_verification, "--copy-video"], timeout=300)
+            run([sys.executable, REPOSITORY / "scripts" / "verify-web-hls.py", "--runtime", paths["stremio-runtime"], "--ffmpeg", ffmpeg, "--ffprobe", ffprobe, "--output-dir", copied_verification, "--copy-video", "--adjacent-tools"], timeout=300)
             report["smoke"]["runtime_hls_video_copy"] = json.loads((copied_verification / "results.json").read_text())
     return report
 
@@ -289,7 +294,7 @@ def main():
     name = f"stremio-runtime-{args.version}-{args.platform}"
     if args.platform.startswith("windows-"):
         archive = args.output / (name + ".zip")
-        with zipfile.ZipFile(archive, "w", compression=zipfile.ZIP_DEFLATED, compresslevel=9) as destination:
+        with zipfile.ZipFile(archive, "w", compression=zipfile.ZIP_DEFLATED, compresslevel=9, strict_timestamps=False) as destination:
             for path in sorted(bundle.rglob("*")):
                 if path.is_file():
                     destination.write(path, str(Path(name) / path.relative_to(bundle)))

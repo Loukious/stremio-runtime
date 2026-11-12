@@ -37,6 +37,7 @@ def main():
     parser.add_argument('--output-dir', type=Path, default=Path('target/web-hls-verification'))
     parser.add_argument('--serve-browser', action='store_true', help='Keep the isolated fixture and runtime running for browser checks')
     parser.add_argument('--copy-video', action='store_true', help='Verify H.264 B-frame copying with audio conversion instead of forced video encoding')
+    parser.add_argument('--adjacent-tools', action='store_true', help='Require runtime media tools beside its executable with no PATH or tool overrides')
     args = parser.parse_args()
     if not args.ffmpeg or not args.ffprobe:
         parser.error('Provide FFmpeg and FFprobe executable paths')
@@ -131,6 +132,10 @@ def main():
         STREMIO_SERVICE_PORT='0',
         STREMIO_FFMPEG_PATH=str(Path(args.ffmpeg).resolve()), STREMIO_FFPROBE_PATH=str(Path(args.ffprobe).resolve()),
         RUST_LOG='warn')
+    if args.adjacent_tools:
+        for name in ('STREMIO_FFMPEG_PATH', 'STREMIO_FFPROBE_PATH', 'FONTCONFIG_FILE'):
+            environment.pop(name, None)
+        environment['PATH'] = ''
     process = subprocess.Popen([str(args.runtime.resolve())], env=environment, stdout=log, stderr=subprocess.STDOUT)
     runtime_url = None
     try:
@@ -226,7 +231,8 @@ def main():
         request(runtime_url + '/hlsv2/fixture-api/destroy')
         _, data = request(runtime_url + '/hlsv2/status')
         assert 'fixture-api' not in json.loads(data)
-        results = {'passed': True, 'copyVideo': args.copy_video, 'runtimeURL': runtime_url, 'sourceURL': source_url,
+        results = {'passed': True, 'copyVideo': args.copy_video, 'adjacentTools': args.adjacent_tools,
+            'runtimeURL': runtime_url, 'sourceURL': source_url,
             'browserFixture': f'http://127.0.0.1:{origin.server_port}/', 'requests': requests}
         (output / 'results.json').write_text(json.dumps(results, indent=2) + '\n', encoding='utf-8')
         print(json.dumps({key: value for key, value in results.items() if key != 'requests'}

@@ -66,8 +66,17 @@ async fn get_settings(State(state): State<AppState>) -> Json<Value> {
     }))
 }
 
-async fn post_settings(State(state): State<AppState>, body: Bytes) -> AppResult<Json<Value>> {
-    let patch = parse_json_body::<Map<String, Value>>(&body)?;
+async fn post_settings(State(state): State<AppState>, body: Bytes) -> Response {
+    let patch = match parse_json_body::<Map<String, Value>>(&body) {
+        Ok(patch) => patch,
+        Err(err) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(json!({ "error": err.0.to_string() })),
+            )
+                .into_response();
+        }
+    };
     let app_path = {
         let values = state.settings.values.read().await;
         values
@@ -76,7 +85,10 @@ async fn post_settings(State(state): State<AppState>, body: Bytes) -> AppResult<
             .map(PathBuf::from)
             .unwrap_or_else(server_app_path)
     };
-    state.settings.update(patch, &app_path).await;
+    if let Err((status, err)) = state.settings.update(patch, &app_path).await {
+        warn!(error = %err, "updating settings failed");
+        return (status, Json(json!({ "error": err.to_string() }))).into_response();
+    }
     {
         let torrents = state.torrents.clone();
         let settings = state.settings.clone();
@@ -84,7 +96,7 @@ async fn post_settings(State(state): State<AppState>, body: Bytes) -> AppResult<
             torrents.cleanup_cache_to_limit(&settings).await;
         });
     }
-    Ok(Json(json!({ "success": true })))
+    Json(json!({ "success": true })).into_response()
 }
 
 async fn network_info() -> Json<Value> {

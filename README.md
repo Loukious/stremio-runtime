@@ -46,6 +46,13 @@ By default the runtime starts in single-user mode and cleans up inactive torrent
 when the stream is no longer needed. Pass `--multi-user` to keep torrents around longer for
 shared-machine setups where another user may still want the same stream or torrent data.
 
+Changing `cacheRoot` through `POST /settings` applies to newly started torrents immediately;
+active torrents keep their original folders. The selected folder must already exist and be
+writable. Settings are saved atomically before becoming active: invalid folders return HTTP
+400 with a JSON `error`, and failed saves return HTTP 500 with a JSON `error`. An explicit
+`STREMIO_SERVICE_CACHE` environment override continues to take precedence. Previous cache
+folders remain subject to the existing cache-size reaper, which protects active torrents.
+
 ---
 
 ## Stremio Service Endpoint Map

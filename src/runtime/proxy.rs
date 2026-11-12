@@ -157,6 +157,37 @@ fn proxy_build_downstream_headers(upstream: &HeaderMap, overrides: &[String]) ->
     headers
 }
 
+fn proxy_protect_response(headers: &mut HeaderMap, source: &url::Url) {
+    let html = headers
+        .get(CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .is_some_and(|v| v.to_ascii_lowercase().contains("text/html"));
+    if html {
+        headers.insert(CACHE_CONTROL, HeaderValue::from_static("no-cache"));
+    }
+    headers.insert(
+        "x-content-type-options",
+        HeaderValue::from_static("nosniff"),
+    );
+    let web_ui = source.scheme() == "https"
+        && source.port_or_known_default() == Some(443)
+        && source.host_str().is_some_and(|host| {
+            matches!(
+                host,
+                "web.stremio.com" | "web.strem.io" | "app.strem.io" | "staging.strem.io"
+            )
+        });
+    if !web_ui {
+        headers.insert(
+            "content-security-policy",
+            HeaderValue::from_static("sandbox"),
+        );
+        if html {
+            headers.insert(CONTENT_DISPOSITION, HeaderValue::from_static("attachment"));
+        }
+    }
+}
+
 fn proxy_is_playlist(pathname: &str, response_headers: &HeaderMap) -> bool {
     let ext_is_playlist = Path::new(pathname)
         .extension()
@@ -445,6 +476,7 @@ async fn proxy_impl(
 
     let mut response_headers =
         proxy_build_downstream_headers(response.headers(), &opts.response_headers);
+    proxy_protect_response(&mut response_headers, response.url());
     let is_playlist = proxy_is_playlist(&pathname, &response_headers);
     if is_playlist {
         response_headers.remove(CONTENT_LENGTH);

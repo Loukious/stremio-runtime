@@ -46,6 +46,18 @@ By default the runtime starts in single-user mode and cleans up inactive torrent
 when the stream is no longer needed. Pass `--multi-user` to keep torrents around longer for
 shared-machine setups where another user may still want the same stream or torrent data.
 
+Changing `cacheRoot` through `POST /settings` applies to newly started torrents immediately;
+active torrents keep their original folders. The selected folder must already exist and be
+writable. Settings are saved atomically before becoming active: invalid folders return HTTP
+400 with a JSON `error`, and failed saves return HTTP 500 with a JSON `error`. An explicit
+`STREMIO_SERVICE_CACHE` environment override continues to take precedence. Previous cache
+folders remain subject to the existing cache-size reaper, which protects active torrents.
+
+Media probing requires an installed FFprobe executable. Set `STREMIO_FFPROBE_PATH` to its
+path, place `ffprobe.exe` (`ffprobe` on other platforms) beside the runtime, or make it
+available on `PATH`. The runtime does not download or bundle FFmpeg and does not enable
+transcoding. `GET /probe` returns a JSON error if FFprobe is unavailable.
+
 ---
 
 ## Stremio Service Endpoint Map
@@ -97,7 +109,7 @@ Legend: ✅ Done · ⚠️ Stub (route exists, returns empty/null) · ❌ TODO
 - ❌ `GET /tracks/:url`
 
 ### Probe / HLS
-- ⚠️ `GET /probe` — returns null result; no ffprobe invocation
+- ✅ `GET /probe` — bounded asynchronous FFprobe invocation; requires installed FFprobe
 - ⚠️ `GET /hlsv2/probe` — returns null result; no ffprobe invocation
 - ❌ `GET /hlsv2/:id/:track.m3u8`
 - ❌ `GET /hlsv2/:id/:track/init.mp4`
@@ -145,7 +157,7 @@ Legend: ✅ Done · ⚠️ Stub (route exists, returns empty/null) · ❌ TODO
 
 ### P1 (desktop polish / compatibility)
 
-- [ ] `GET /probe` — invoke ffprobe, return legacy probe model
+- [x] `GET /probe` — invoke ffprobe, return legacy probe model
 - [ ] `GET /tracks/:url` — media track metadata endpoint
 - [ ] Better `/settings` parity for every desktop option value the shell may read
 - [ ] More exact `EngineStats` parity for selections, wires, and source counters
@@ -158,6 +170,7 @@ Legend: ✅ Done · ⚠️ Stub (route exists, returns empty/null) · ❌ TODO
 - `src/runtime/proxy.rs` — `/proxy` option parsing, redirect handling, header forwarding, and playlist rewriting.
 - `src/runtime/opensub.rs` — `/opensubHash` range fetching and OpenSubtitles hash calculation.
 - `src/runtime/subtitles.rs` — subtitle proxying, cue parsing/rendering, offset support, and tracks response.
+- `src/runtime/probe.rs` — bounded FFprobe execution and tolerant legacy media metadata mapping.
 - `src/runtime/app_routes.rs` — small app/service routes such as settings, device info, manifest dispatch, and stubs.
 - `src/runtime/torrent_http.rs` — torrent-facing HTTP routes: create, stats, remove, and stream responses.
 - `src/runtime/torrent_service.rs` — torrent service internals, cache reaper, stats shaping, file guessing, and shared request helpers.
@@ -655,19 +668,30 @@ Routes:
 
 ## Media Probe And Tracks
 
-### `GET /probe` ⚠️
+### `GET /probe` ✅
 
 Inputs:
 
 - Query `url=<url>`.
-- If the URL does not contain `://`, old server prefixes `baseUrlLocal`.
+- HTTP and HTTPS media URLs are supported. Relative streaming paths resolve against
+  the runtime's advertised local URL, including a randomly selected HTTP port.
+- Local file paths and other URL protocols are rejected.
 
 Response:
 
 - `200 application/json` with probe result.
-- `500 application/json` on error, but body is still `JSON.stringify(result)`.
+- `400 application/json` for missing or invalid input.
+- `500 application/json` when FFprobe is unavailable, fails, or returns invalid metadata.
+- `503 application/json` when two probes are already running.
+- `504 application/json` when a probe exceeds its deadline.
+- Error bodies contain an `error` message and `result: null`.
 
-Currently returns `{ "error": null, "result": null }`. Real ffprobe invocation not yet wired.
+FFprobe is discovered through `STREMIO_FFPROBE_PATH`, beside the runtime, then on `PATH`.
+Each probe has a 15-second deadline and bounded output. Video, audio, and subtitle streams
+retain their original indices. Optional or unavailable metadata does not prevent probing:
+unknown bitrate becomes zero, absent frame rates and dimensions become null, and fractional
+duration and frame rate values are preserved. The stream `default` flag is a boolean.
+`GET /hlsv2/probe` remains a separate stub; HLS transcoding is not enabled.
 
 Typical legacy probe model:
 

@@ -1,71 +1,9 @@
-use easy_ffprobe::{FfProbe, Format, StreamKinds, ffprobe};
+static STREAM_REQUEST_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
 
-static STREAM_REQUEST_ID: std::sync::atomic::AtomicU64 =
-    std::sync::atomic::AtomicU64::new(1);
-
-async fn probe(RawQuery(raw_query): RawQuery) -> Json<Value> {
-    let Some(url) = query_first(raw_query.as_deref(), "url") else {
-        return Json(json!({
-            "error": "Missing query parameter: 'url'",
-            "result": null
-        }))
-    };
-    let probe = match ffprobe(url) {
-        Ok(probe) => probe,
-        Err(err) => return Json(json!({
-                "error": err.to_string()
-            })),
-    };
-
-    let FfProbe { streams, format, .. } = probe;
-    let Format { format_name, duration, bit_rate, .. } = format;
-
-    let streams: Vec<_> = streams.into_iter().filter_map(|stream| {
-        let (ty, name, bitrate, tags, vid) = match &stream.stream {
-            StreamKinds::Video(vid) => (
-                "video",
-                &vid.codec_name,
-                vid.bit_rate.unwrap_or(0),
-                vid.tags.as_ref().map(|t| &t.tags),
-                Some(vid),
-            ),
-            StreamKinds::Audio(ad) => (
-                "audio",
-                &ad.codec_name,
-                ad.bit_rate.unwrap_or(0),
-                ad.tags.as_ref().map(|t| &t.tags),
-                None
-            ),
-            _ => return None
-        };
-        let fr = stream.r_frame_rate;
-        let fps = if fr.denominator() != 0 {
-            Some(fr.numerator() as f32 / fr.denominator() as f32)
-        } else { None };
-        Some(json!({
-            "codec_type": ty,
-            "codec_name": name,
-            "stream": stream.index,
-            "bitrate": bitrate,
-            "default": stream.disposition.default,
-            "fps": fps,
-            "size": vid.map(|vid| [vid.width, vid.height]),
-            "lang": tags.and_then(|t| t.language.as_ref()),
-        }))
-    }).collect();
-
-    let container = if format_name.contains("mp4") {
-        "mp4"
-    } else if format_name.contains("matroska") {
-        "matroska"
-    } else {
-        &format_name
-    };
+async fn probe() -> Json<Value> {
     Json(json!({
-        "container": container,
-        "duration": duration.map(|d| d.as_secs()),
-        "bitrate": bit_rate,
-        "streams": streams,
+        "error": null,
+        "result": null
     }))
 }
 
@@ -76,7 +14,12 @@ async fn global_stats(State(state): State<AppState>) -> Json<Value> {
         state.torrents.touch(hash).await;
         out.insert(
             hash.clone(),
-            stats_for_handle(handle, &state.torrents.cache_dir, None, None),
+            stats_for_handle(
+                handle,
+                &state.torrents.output_folder(handle).await,
+                None,
+                None,
+            ),
         );
     }
     Json(Value::Object(out))
@@ -112,7 +55,7 @@ async fn create_magnet(
     );
     Ok(Json(stats_for_handle(
         &handle,
-        &state.torrents.cache_dir,
+        &state.torrents.output_folder(&handle).await,
         guessed,
         guessed,
     )))
@@ -134,7 +77,7 @@ async fn create_from_torrent(State(state): State<AppState>, body: Bytes) -> AppR
     let _ = timeout(CREATE_METADATA_GRACE, handle.wait_until_initialized()).await;
     Ok(Json(stats_for_handle(
         &handle,
-        &state.torrents.cache_dir,
+        &state.torrents.output_folder(&handle).await,
         None,
         None,
     )))
@@ -150,7 +93,7 @@ async fn torrent_stats(
     state.torrents.touch(&handle.info_hash().as_string()).await;
     Json(Some(stats_for_handle(
         &handle,
-        &state.torrents.cache_dir,
+        &state.torrents.output_folder(&handle).await,
         None,
         None,
     )))
@@ -174,7 +117,7 @@ async fn torrent_file_stats(
 
     Json(Some(stats_for_handle(
         &handle,
-        &state.torrents.cache_dir,
+        &state.torrents.output_folder(&handle).await,
         Some(file_idx),
         None,
     )))
@@ -237,8 +180,7 @@ async fn stream_common(
     headers: HeaderMap,
 ) -> AppResult<Response> {
     let t0 = std::time::Instant::now();
-    let request_id =
-        STREAM_REQUEST_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let request_id = STREAM_REQUEST_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     let query = parse_stream_query(raw_query.as_deref());
     let normalized_info_hash = match normalize_info_hash(&info_hash) {
         Ok(hash) => hash,
@@ -429,9 +371,7 @@ async fn stream_common(
         {
             warn!(
                 request_id,
-                file_idx,
-                "select_file failed (non-fatal): {:?}",
-                e.0
+                file_idx, "select_file failed (non-fatal): {:?}", e.0
             );
         }
     }
@@ -615,13 +555,7 @@ async fn stream_common(
             );
         }
         if query.download {
-            headers.insert(
-                CONTENT_DISPOSITION,
-                header_value(&format!(
-                    "attachment; filename=\"{}\"",
-                    file.name.replace('"', "")
-                ))?,
-            );
+            headers.insert(CONTENT_DISPOSITION, download_disposition(&file.name));
         }
         if let Some(sec) = query.subtitles_sec {
             headers.insert("CaptionInfo.sec", header_value(&sec)?);
@@ -747,6 +681,24 @@ async fn stream_common(
 
     let body = Body::from_stream(body_stream);
     Ok(response.body(body).context("building stream response")?)
+}
+
+fn download_disposition(name: &str) -> HeaderValue {
+    let fallback: String = name
+        .chars()
+        .map(|ch| {
+            if ch.is_ascii() && !ch.is_ascii_control() && !matches!(ch, '"' | '\\' | '/') {
+                ch
+            } else {
+                '_'
+            }
+        })
+        .collect();
+    let encoded = utf8_percent_encode(name, percent_encoding::NON_ALPHANUMERIC);
+    HeaderValue::from_str(&format!(
+        "attachment; filename=\"{fallback}\"; filename*=UTF-8''{encoded}"
+    ))
+    .expect("download filename is ASCII and percent encoded")
 }
 
 async fn fallback(method: Method, uri: axum::http::Uri) -> Response {

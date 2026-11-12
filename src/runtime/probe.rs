@@ -1,4 +1,4 @@
-use std::{ffi::OsString, process::Stdio, time::Duration};
+use std::{ffi::OsString, fmt, process::Stdio, time::Duration};
 
 use axum::{
     Json,
@@ -16,6 +16,14 @@ use url::Url;
 
 use super::AppState;
 
+#[path = "probe_hls.rs"]
+mod hls;
+#[path = "probe_samples.rs"]
+mod samples;
+
+pub(super) use hls::{HlsProbe, HlsSamples, HlsStream, hls_probe, probe_media};
+pub(super) use samples::probe_samples;
+
 static PROBE_SLOTS: Semaphore = Semaphore::const_new(2);
 const PROBE_LIMITS: Limits = Limits {
     timeout: Duration::from_secs(15),
@@ -30,8 +38,8 @@ struct Limits {
     stderr: usize,
 }
 
-#[derive(Debug, PartialEq)]
-enum ProbeError {
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(super) enum ProbeError {
     InvalidInput,
     Busy,
     Unavailable,
@@ -39,7 +47,25 @@ enum ProbeError {
     OutputTooLarge,
     InvalidOutput,
     Timeout,
+    SamplesUnavailable,
 }
+
+impl fmt::Display for ProbeError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(match self {
+            Self::InvalidInput => "invalid HTTP(S) media URL or relative media path",
+            Self::Busy => "media probing is busy; try again later",
+            Self::Unavailable => "ffprobe is unavailable",
+            Self::ProcessFailed => "ffprobe could not probe the media",
+            Self::OutputTooLarge => "media metadata exceeded the limit",
+            Self::InvalidOutput => "ffprobe returned invalid metadata",
+            Self::Timeout => "media probing timed out",
+            Self::SamplesUnavailable => "media sample timing metadata is unavailable",
+        })
+    }
+}
+
+impl std::error::Error for ProbeError {}
 
 impl IntoResponse for ProbeError {
     fn into_response(self) -> Response {
@@ -65,6 +91,10 @@ impl IntoResponse for ProbeError {
             Self::InvalidOutput => (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 "ffprobe returned invalid metadata",
+            ),
+            Self::SamplesUnavailable => (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "media sample timing metadata is unavailable",
             ),
         };
         (status, Json(json!({"error": message, "result": null}))).into_response()
@@ -97,7 +127,7 @@ pub(super) async fn probe(
     }
 }
 
-fn resolve_media_url(input: &str, base: &str) -> Result<Url, ProbeError> {
+pub(super) fn resolve_media_url(input: &str, base: &str) -> Result<Url, ProbeError> {
     if input.is_empty()
         || input.len() > 8192
         || input
@@ -132,7 +162,7 @@ fn resolve_media_url(input: &str, base: &str) -> Result<Url, ProbeError> {
     Ok(url)
 }
 
-fn ffprobe_executable() -> OsString {
+pub(super) fn ffprobe_executable() -> OsString {
     if let Some(path) = std::env::var_os("STREMIO_FFPROBE_PATH").filter(|path| !path.is_empty()) {
         return path;
     }

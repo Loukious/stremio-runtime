@@ -1,10 +1,14 @@
 async fn root(State(state): State<AppState>) -> Response {
     let base_url = state.base_url.read().await.clone();
-    let app_url = format!(
-        "https://app.strem.io/shell-v4.4/#?streamingServer={}",
-        utf8_percent_encode(&base_url, PATH_SEGMENT_ENCODE_SET)
-    );
+    let app_url = current_web_ui_url(&base_url);
     redirect(StatusCode::TEMPORARY_REDIRECT, &app_url)
+}
+
+fn current_web_ui_url(base_url: &str) -> String {
+    let mut query = form_urlencoded::Serializer::new(String::new());
+    query.append_pair("streamingServerUrl", base_url.trim_end_matches('/'));
+    let query = query.finish();
+    format!("https://web.stremio.com/#/?{query}")
 }
 
 async fn favicon() -> Response {

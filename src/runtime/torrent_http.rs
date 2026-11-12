@@ -1,12 +1,5 @@
 static STREAM_REQUEST_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
 
-async fn probe() -> Json<Value> {
-    Json(json!({
-        "error": null,
-        "result": null
-    }))
-}
-
 async fn global_stats(State(state): State<AppState>) -> Json<Value> {
     let handles = state.torrents.handles.read().await;
     let mut out = Map::new();

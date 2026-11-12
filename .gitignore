@@ -1,2 +1,7 @@
 /target
 /.stremio-service-cache
+/tests/web/node_modules
+/.release-cache
+/bundle
+/dist
+__pycache__/

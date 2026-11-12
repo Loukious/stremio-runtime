@@ -26,12 +26,14 @@ original Node.js torrent-stream.
 
 ## Status and caveats
 
-This is a **work in progress** based on black-box reverse engineering. The HTTP contract was
-inferred by reading `server.js`, the Android APK's API wrapper, and observing live traffic and not
-from any official documentation or source access.
+This is a **work in progress** based on the supplied `server.js` bundle, public Stremio
+Web player source, the Android APK's API wrapper, and observed traffic. It is an
+independent implementation rather than an officially documented service API.
 
 - Core torrent streaming and all P0 desktop playback routes are working.
-- HLS transcoding, casting, archive sources, and other P1/P2 features are not yet implemented.
+- Current Stremio Web's HLSv2 probe and on-demand H.264/AAC conversion are implemented,
+  including seeking, multiple audio tracks, channel downmixing, and embedded subtitles.
+- Casting, archive sources, legacy HLS routes, and other P1/P2 features remain incomplete.
 - Behaviour may diverge from the original in untested edge cases.
 
 See the endpoint map below for a full breakdown of what is and isn't implemented yet.
@@ -53,10 +55,17 @@ writable. Settings are saved atomically before becoming active: invalid folders 
 `STREMIO_SERVICE_CACHE` environment override continues to take precedence. Previous cache
 folders remain subject to the existing cache-size reaper, which protects active torrents.
 
-Media probing requires an installed FFprobe executable. Set `STREMIO_FFPROBE_PATH` to its
-path, place `ffprobe.exe` (`ffprobe` on other platforms) beside the runtime, or make it
-available on `PATH`. The runtime does not download or bundle FFmpeg and does not enable
-transcoding. `GET /probe` returns a JSON error if FFprobe is unavailable.
+Standalone release archives include the runtime, FFmpeg, and FFprobe for Windows,
+Linux, and macOS on x64 and ARM64. Extract the whole archive, run the runtime, and open
+its announced URL to launch current Stremio Web with that streaming server selected.
+See [standalone releases](docs/standalone-releases.md) for requirements and the release workflow.
+
+Native desktop playback through MPV uses its own decoders. Browser playback uses FFprobe
+to inspect media and FFmpeg for HLS conversion when needed. The tools are discovered through
+`STREMIO_FFMPEG_PATH` / `STREMIO_FFPROBE_PATH`, beside the runtime, then on `PATH`.
+Missing tools return JSON errors; the runtime never downloads executables at startup.
+See [HLSv2 probe API](docs/hlsv2-api.md) and [HLSv2 playback](docs/hlsv2-playback.md)
+for the media contract, copying rules, and limits.
 
 ---
 
@@ -110,18 +119,19 @@ Legend: ✅ Done · ⚠️ Stub (route exists, returns empty/null) · ❌ TODO
 
 ### Probe / HLS
 - ✅ `GET /probe` — bounded asynchronous FFprobe invocation; requires installed FFprobe
-- ⚠️ `GET /hlsv2/probe` — returns null result; no ffprobe invocation
-- ❌ `GET /hlsv2/:id/:track.m3u8`
-- ❌ `GET /hlsv2/:id/:track/init.mp4`
-- ❌ `GET /hlsv2/:id/:track/segment:n.:ext`
-- ❌ `GET /hlsv2/:id/burn`
-- ❌ `GET /hlsv2/status`
-- ❌ `GET /hlsv2/:id/destroy`
+- ✅ `GET /hlsv2/probe` — bounded FFprobe metadata and optional sample timing
+- ✅ `GET /hlsv2/:id/master.m3u8` and `:track.m3u8`
+- ✅ `GET /hlsv2/:id/:track/init.mp4`
+- ✅ `GET /hlsv2/:id/:track/segment:n.:ext` — fMP4 and WebVTT
+- ✅ `GET /hlsv2/:id/source/subtitle/:id.ass` and `source/attachment/:id`
+- ✅ `GET /hlsv2/:id/burn`
+- ✅ `GET /hlsv2/status`
+- ✅ `GET /hlsv2/:id/destroy`
 - ❌ HLSv2 compat routes (`/:infoHash/:videoId/:playlist`)
 - ❌ Legacy HLS routes (`/:first/:second/hls.m3u8`, `stream.m3u8`, segments, etc.)
 
 ### System / Info Routes
-- ✅ `GET /` — 307 redirect to web UI with `?streamingServer=`
+- ✅ `GET /` — 307 redirect to current Web with `#/?streamingServerUrl=`
 - ✅ `GET /network-info`
 - ✅ `GET /device-info`
 - ✅ `GET /hwaccel-profiler`
@@ -171,19 +181,21 @@ Legend: ✅ Done · ⚠️ Stub (route exists, returns empty/null) · ❌ TODO
 - `src/runtime/opensub.rs` — `/opensubHash` range fetching and OpenSubtitles hash calculation.
 - `src/runtime/subtitles.rs` — subtitle proxying, cue parsing/rendering, offset support, and tracks response.
 - `src/runtime/probe.rs` — bounded FFprobe execution and tolerant legacy media metadata mapping.
+- `src/runtime/probe_hls.rs` / `probe_samples.rs` — Web probe metadata and bounded MP4/Matroska timing reads.
+- `src/runtime/hls.rs` / `hls_process.rs` / `hls_mp4.rs` — HLS sessions, bounded FFmpeg processes, and fMP4 timing.
 - `src/runtime/app_routes.rs` — small app/service routes such as settings, device info, manifest dispatch, and stubs.
 - `src/runtime/torrent_http.rs` — torrent-facing HTTP routes: create, stats, remove, and stream responses.
 - `src/runtime/torrent_service.rs` — torrent service internals, cache reaper, stats shaping, file guessing, and shared request helpers.
 
 ### P2 (casting, HLS, transcoding, and non-desktop clients)
 
-- [ ] `GET /hlsv2/probe` — invoke ffprobe, return HLSv2 format+streams+samples model
-- [ ] `GET /hlsv2/:id/:track.m3u8` — fMP4 HLS playlist generation
-- [ ] `GET /hlsv2/:id/:track/init.mp4` — fMP4 init segment
-- [ ] `GET /hlsv2/:id/:track/segment:n.:ext` — fMP4 media segments and VTT subtitle segments
-- [ ] `GET /hlsv2/:id/burn` — embedded subtitle burn-in
-- [ ] `GET /hlsv2/status` — converter session map
-- [ ] `GET /hlsv2/:id/destroy` — tear down converter session
+- [x] `GET /hlsv2/probe` — invoke ffprobe, return HLSv2 format+streams+samples model
+- [x] `GET /hlsv2/:id/:track.m3u8` — fMP4 HLS playlist generation
+- [x] `GET /hlsv2/:id/:track/init.mp4` — fMP4 init segment
+- [x] `GET /hlsv2/:id/:track/segment:n.:ext` — fMP4 media segments and VTT subtitle segments
+- [x] `GET /hlsv2/:id/burn` — embedded subtitle burn-in
+- [x] `GET /hlsv2/status` — converter session map
+- [x] `GET /hlsv2/:id/destroy` — tear down converter session
 - [ ] HLSv2 compat routes — `/:infoHash/:videoId/:playlist` rewrite into hlsv2 router
 - [ ] Legacy HLS routes — `hls.m3u8`, `stream.m3u8`, `stream-q-*.m3u8`, `.ts` segments, `dlna`, `subs-*.m3u8`, `thumb.jpg`
 - [ ] `GET /casting` — real device discovery (Chromecast etc.)
@@ -498,122 +510,31 @@ Notes:
 - `streamLen`, `streamName`, and `streamProgress` are only present for a valid `idx`.
 - `uploadSpeed` in the old server accidentally mirrors `downloadSpeed`.
 
-## HLSv2 Routes ❌
+## HLSv2 Routes ✅
 
-Mounted at `/hlsv2` unless disabled by environment. Not yet implemented except for the probe stub.
+Current Web uses `GET /hlsv2/probe?mediaURL=...` to inspect media, then
+`/hlsv2/:id/master.m3u8` for browser playback requiring conversion. The runtime
+serves separate video, audio, and WebVTT playlists and generates fMP4 segments
+on demand. Seeking to the end does not require converting the preceding movie.
+Audio tracks can be selected independently, and channel limits trigger downmixing.
 
-Every route with `:id` creates or reuses a converter. Converter creation query params:
+FFprobe provides the rich `format`, `streams`, and optional `samples` contract.
+FFmpeg supplies software H.264/AAC encoding, compatible stream copying,
+ASS extraction, attachments, and optional subtitle burn-in. Converter shutdown,
+idle eviction, process limits, deadlines, and output limits bound resource use.
 
-- `mediaURL`: source media URL, required.
-- `maxAudioChannels`: integer, optional.
-- `forceTranscoding`: truthy query param, optional.
-- `profile`: hardware/transcode profile, optional.
-- `maxWidth`: optional.
-- `videoCodecs`: string or repeated query param.
-- `audioCodecs`: string or repeated query param.
+The implementation currently supports finite-duration HTTP(S) media and relative
+runtime streaming URLs. Live/unknown-duration media, hardware profiles, and the
+older root-level HLS compatibility routes below remain unsupported. Current Web's
+optional `/subtitleSignature` request is also unsupported, as in the supplied
+upstream bundle; the player handles its absence and continues subtitle playback.
 
-### `GET /hlsv2/:id/:track.m3u8` ❌
-
-Inputs:
-
-- `track`: usually `video0`, `audio0`, `subtitle0`, etc.
-
-Response:
-
-- `200 application/vnd.apple.mpegurl`
-- Playlist body.
-- `500 application/json` on failure:
-
-```json
-{
-  "error": {
-    "code": 10,
-    "message": "Failed to read hls playlist: ..."
-  }
-}
-```
-
-### `GET /hlsv2/:id/:track/init.mp4` ❌
-
-Inputs:
-
-- `track` must start with `video` or `audio`.
-
-Response:
-
-- `200 video/mp4`
-- fMP4 init segment.
-- `500 application/json` with error code `20` on failure.
-
-### `GET /hlsv2/:id/:track/segment:sequenceNumber.:ext` ❌
-
-Inputs:
-
-- `sequenceNumber`: integer.
-- `ext`: `m4s` for video/audio tracks, `vtt` for subtitle tracks.
-
-Response:
-
-- `200 video/mp4` for `.m4s`.
-- `200 text/vtt` for `.vtt`.
-- `500 application/json` with error code `30` on failure.
-
-### `GET /hlsv2/:id/burn` ❌
-
-Inputs:
-
-- Query `url=<subtitle-url>`.
-- Query `id=<subtitle-track-id>`.
-
-Response:
-
-- `200` empty body on success.
-- `500 application/json` with error code `40` on failure.
-
-### `GET /hlsv2/probe` ⚠️
-
-Inputs:
-
-- Query `mediaURL=<url>`, required.
-- Query `samples=1` optional. Attempts to include MP4 or Matroska samples.
-
-Response:
-
-- `200 application/json`
-
-```json
-{
-  "format": {},
-  "streams": [],
-  "samples": {}
-}
-```
-
-Currently returns `{ "error": null, "result": null }`. Real ffprobe invocation not yet wired.
-
-- `500 application/json` on failure. Old code labels the error as `PROBE_FAILED`.
-
-### `GET /hlsv2/status` ❌
-
-Response:
-
-- `200 application/json`
-- Object keyed by converter id:
-
-```json
-{
-  "<id>": {
-    "status": {},
-    "touched": "date"
-  }
-}
-```
-
-### `GET /hlsv2/:id/destroy` ❌
-
-Response:
-
-- `200` empty body.
+See [HLSv2 probe API](docs/hlsv2-api.md) and [HLSv2 playback](docs/hlsv2-playback.md)
+for query parameters, routes, response models, copying rules, error codes, and
+operational limits. The implementation was
+checked against the supplied `server.js` and exercised with current
+`@stremio/stremio-video` version 0.0.103. See [Web playback verification](tests/web/README.md)
+to repeat the real-media API and browser checks.
 
 ### HLSv2 Compatibility Route ❌
 
@@ -691,7 +612,7 @@ Each probe has a 15-second deadline and bounded output. Video, audio, and subtit
 retain their original indices. Optional or unavailable metadata does not prevent probing:
 unknown bitrate becomes zero, absent frame rates and dimensions become null, and fractional
 duration and frame rate values are preserved. The stream `default` flag is a boolean.
-`GET /hlsv2/probe` remains a separate stub; HLS transcoding is not enabled.
+`GET /hlsv2/probe` supplies the separate current Web model described above.
 
 Typical legacy probe model:
 
@@ -940,7 +861,7 @@ Requires `Host` header.
 
 Response:
 
-- `307` redirect to configured web UI with query `streamingServer=<encoded current server URL>`.
+- `307` redirect to `https://web.stremio.com/#/?streamingServerUrl=<encoded current server URL>`.
 
 ## Proxy Routes ❌
 

@@ -1,0 +1,253 @@
+name: Standalone runtime bundles
+
+on:
+  pull_request:
+    paths:
+      - "src/**"
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - "scripts/**"
+      - ".github/workflows/standalone-releases.yml"
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+    inputs:
+      publish:
+        description: Publish assets to an existing v* tag (otherwise upload workflow artifacts only)
+        type: boolean
+        default: false
+      tag:
+        description: Existing v* tag to build; required when publish is true
+        type: string
+        default: ""
+
+permissions:
+  contents: read
+
+concurrency:
+  group: standalone-runtime-${{ github.ref }}-${{ inputs.tag }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+env:
+  RUST_VERSION: "1.99.1"
+  PYTHON_VERSION: "3.13"
+  MEDIA_BUILD_JOBS: "4"
+
+jobs:
+  prepare:
+    runs-on: ubuntu-24.04
+    outputs:
+      ref: ${{ steps.version.outputs.ref }}
+      version: ${{ steps.version.outputs.version }}
+      publish: ${{ steps.version.outputs.publish }}
+      tag: ${{ steps.version.outputs.tag }}
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Resolve and validate release revision
+        id: version
+        shell: python
+        env:
+          REQUESTED_TAG: ${{ inputs.tag }}
+          REQUESTED_PUBLISH: ${{ inputs.publish }}
+        run: |
+          import os, re, subprocess, tomllib
+          from pathlib import Path
+          tagged = os.environ["GITHUB_REF_TYPE"] == "tag"
+          tag = os.environ["GITHUB_REF_NAME"] if tagged else os.environ.get("REQUESTED_TAG", "")
+          publish = tagged or os.environ.get("REQUESTED_PUBLISH") == "true"
+          if publish and not tag:
+              raise SystemExit("Publishing requires an existing v* tag")
+          if tag and not re.fullmatch(r"v[0-9][A-Za-z0-9.+-]*", tag):
+              raise SystemExit("Tag must start with v followed by a version number")
+          ref = "refs/tags/" + tag if tag else os.environ["GITHUB_SHA"]
+          commit = subprocess.check_output(["git", "rev-parse", "--verify", ref + "^{commit}"], text=True).strip()
+          manifest = subprocess.check_output(["git", "show", commit + ":Cargo.toml"], text=True)
+          runtime_version = tomllib.loads(manifest)["package"]["version"]
+          if tag and tag != "v" + runtime_version:
+              raise SystemExit("Release tag must match Cargo.toml version")
+          version = tag[1:] if tag else runtime_version + "-dev." + commit[:8]
+          with open(os.environ["GITHUB_OUTPUT"], "a") as output:
+              output.write(f"ref={commit}\nversion={version}\npublish={str(publish).lower()}\ntag={tag}\n")
+
+  build:
+    needs: prepare
+    name: Build and verify ${{ matrix.platform }}
+    runs-on: ${{ matrix.runner }}
+    container: ${{ matrix.container }}
+    timeout-minutes: 120
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: windows-x64
+            runner: windows-2022
+            container: ""
+            target: x86_64-pc-windows-msvc
+            msystem: CLANG64
+            msvc_arch: amd64
+          - platform: windows-arm64
+            runner: windows-11-arm
+            container: ""
+            target: aarch64-pc-windows-msvc
+            msystem: CLANGARM64
+            msvc_arch: arm64
+          - platform: linux-x64
+            runner: ubuntu-24.04
+            container: ubuntu:22.04
+            target: x86_64-unknown-linux-gnu
+          - platform: linux-arm64
+            runner: ubuntu-24.04-arm
+            container: ubuntu:22.04
+            target: aarch64-unknown-linux-gnu
+          - platform: macos-x64
+            runner: macos-15-intel
+            container: ""
+            target: x86_64-apple-darwin
+          - platform: macos-arm64
+            runner: macos-15
+            container: ""
+            target: aarch64-apple-darwin
+    steps:
+      - name: Install Linux build tools
+        if: startsWith(matrix.platform, 'linux-')
+        shell: bash
+        run: |
+          apt-get update
+          DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends build-essential binutils ca-certificates cmake curl git gperf nasm ninja-build perl pkg-config python3 python3-pip python-is-python3 xz-utils
+      - name: Preserve shell script line endings on Windows
+        if: startsWith(matrix.platform, 'windows-')
+        run: git config --global core.autocrlf false
+      - uses: actions/checkout@v6
+        with:
+          ref: ${{ needs.prepare.outputs.ref }}
+          persist-credentials: false
+      - name: Trust the checked-out Linux workspace
+        if: startsWith(matrix.platform, 'linux-')
+        shell: bash
+        run: git config --global --add safe.directory "$GITHUB_WORKSPACE"
+      - uses: actions/setup-python@v6
+        if: "!startsWith(matrix.platform, 'linux-')"
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+      - uses: actions-rust-lang/setup-rust-toolchain@v1
+        with:
+          toolchain: ${{ env.RUST_VERSION }}
+          target: ${{ matrix.target }}
+          cache: false
+      - name: Cache Rust build
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: runtime-${{ matrix.platform }}-${{ env.RUST_VERSION }}-${{ hashFiles('Cargo.lock') }}
+      - name: Cache verified media source downloads
+        uses: actions/cache@v4
+        with:
+          path: .release-cache/downloads
+          key: media-source-${{ hashFiles('scripts/ffmpeg-lock.json') }}
+      - name: Configure MSYS2 native Clang tools
+        if: startsWith(matrix.platform, 'windows-')
+        uses: msys2/setup-msys2@v2
+        with:
+          msystem: ${{ matrix.msystem }}
+          update: true
+          install: make diffutils perl python nasm
+          pacboy: clang:p lld:p llvm:p pkgconf:p meson:p ninja:p
+      - name: Install macOS media build tools
+        if: startsWith(matrix.platform, 'macos-')
+        shell: bash
+        run: brew install nasm ninja pkg-config
+      - name: Install pinned Meson
+        if: "!startsWith(matrix.platform, 'windows-')"
+        run: python -m pip install --disable-pip-version-check meson==1.12.1 tomli==2.3.0
+      - name: Fetch media sources and license payloads
+        run: python scripts/prepare-ffmpeg.py --platform ${{ matrix.platform }} --output bundle
+      - name: Build native Windows media tools
+        if: startsWith(matrix.platform, 'windows-')
+        shell: msys2 {0}
+        run: bash scripts/build-media-tools.sh "${{ matrix.platform }}" bundle
+      - name: Build native Unix media tools
+        if: "!startsWith(matrix.platform, 'windows-')"
+        shell: bash
+        run: bash scripts/build-media-tools.sh "${{ matrix.platform }}" bundle
+      - name: Configure native MSVC
+        if: startsWith(matrix.platform, 'windows-')
+        uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: ${{ matrix.msvc_arch }}
+      - name: Build and test runtime
+        shell: python
+        env:
+          PLATFORM: ${{ matrix.platform }}
+          RUST_TARGET: ${{ matrix.target }}
+        run: |
+          import os, subprocess
+          from pathlib import Path
+          env = os.environ.copy()
+          platform = env["PLATFORM"]
+          suffix = ".exe" if platform.startswith("windows-") else ""
+          media_tools = Path("bundle").resolve()
+          env["PATH"] = str(media_tools) + os.pathsep + env["PATH"]
+          env["STREMIO_FFMPEG_PATH"] = str(media_tools / ("ffmpeg" + suffix))
+          env["STREMIO_FFPROBE_PATH"] = str(media_tools / ("ffprobe" + suffix))
+          env["FONTCONFIG_FILE"] = str(media_tools / "fonts.conf")
+          if platform.startswith("windows-"):
+              env["RUSTFLAGS"] = env.get("RUSTFLAGS", "") + " -C target-feature=+crt-static"
+          elif platform.startswith("linux-"):
+              env["OPENSSL_DIR"] = str(Path(".release-cache/build/prefix").resolve())
+              env["OPENSSL_STATIC"] = "1"
+          elif platform.startswith("macos-"):
+              env["MACOSX_DEPLOYMENT_TARGET"] = "13.0"
+          subprocess.run(["cargo", "test", "--locked", "--target", env["RUST_TARGET"]], env=env, check=True)
+          subprocess.run(["cargo", "test", "--locked", "--target", env["RUST_TARGET"], "media_hls", "--", "--include-ignored", "--test-threads=1"], env=env, check=True)
+          subprocess.run(["cargo", "build", "--locked", "--release", "--target", env["RUST_TARGET"]], env=env, check=True)
+      - name: Verify architecture, dependencies, codecs, runtime and HLS; package
+        shell: python
+        env:
+          PLATFORM: ${{ matrix.platform }}
+          RUST_TARGET: ${{ matrix.target }}
+          PACKAGE_VERSION: ${{ needs.prepare.outputs.version }}
+        run: |
+          import os, subprocess
+          platform = os.environ["PLATFORM"]
+          suffix = ".exe" if platform.startswith("windows-") else ""
+          subprocess.run(["python", "scripts/package-runtime.py", "--platform", platform, "--runtime", f"target/{os.environ['RUST_TARGET']}/release/stremio-runtime{suffix}", "--bundle", "bundle", "--output", "dist", "--version", os.environ["PACKAGE_VERSION"], "--smoke-hls"], check=True)
+      - uses: actions/upload-artifact@v4
+        with:
+          name: stremio-runtime-${{ matrix.platform }}
+          path: dist/*
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 14
+
+  release:
+    needs: [prepare, build]
+    if: needs.prepare.outputs.publish == 'true'
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v5
+        with:
+          pattern: stremio-runtime-*
+          path: dist
+          merge-multiple: true
+      - name: Publish verified release assets
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          RELEASE_TAG: ${{ needs.prepare.outputs.tag }}
+        run: |
+          set -euo pipefail
+          if ! gh release view "$RELEASE_TAG" >/dev/null 2>&1; then
+            release_args=(--verify-tag --generate-notes)
+            if [[ "$RELEASE_TAG" == *-* ]]; then release_args+=(--prerelease); fi
+            gh release create "$RELEASE_TAG" "${release_args[@]}"
+          fi
+          gh release upload "$RELEASE_TAG" dist/*

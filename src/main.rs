@@ -29,8 +29,8 @@ use axum::{
 use chrono::{SecondsFormat, Utc};
 use futures_util::{Stream, StreamExt, TryStreamExt};
 use librqbit::{
-    AddTorrent, AddTorrentOptions, ConnectionOptions, ListenerOptions, Magnet,
-    PeerConnectionOptions, Session, SessionOptions, api::TorrentIdOrHash, dht::PersistentDhtConfig,
+    AddTorrent, AddTorrentOptions, ConnectionOptions, DhtSessionConfig, ListenerOptions, Magnet,
+    PeerConnectionOptions, Session, SessionOptions, api::TorrentIdOrHash,
 };
 use librqbit_core::torrent_metainfo::torrent_from_bytes;
 use percent_encoding::{AsciiSet, CONTROLS, percent_decode_str, utf8_percent_encode};
@@ -146,6 +146,7 @@ struct AppState {
     settings: Arc<SettingsStore>,
     local_addon: Arc<LocalAddonIndex>,
     downloads: Arc<DownloadManager>,
+    hls: media_hls::HlsService,
 }
 
 struct TorrentService {
@@ -466,6 +467,22 @@ struct SubtitleExt {
 
 #[tokio::main(worker_threads = 32)]
 async fn main() -> anyhow::Result<()> {
+    if std::env::args().any(|arg| arg == "--version" || arg == "-V") {
+        println!("stremio-runtime {}", env!("CARGO_PKG_VERSION"));
+        return Ok(());
+    }
+    if std::env::args().any(|arg| arg == "--help" || arg == "-h") {
+        println!(
+            "stremio-runtime {}\n\nUsage: stremio-runtime [--multi-user] [--version]\n\n\
+             Environment:\n  STREMIO_SERVICE_PORT   HTTP port (default 11470)\n  \
+             STREMIO_FFMPEG_PATH    FFmpeg executable (otherwise beside runtime or on PATH)\n  \
+             STREMIO_FFPROBE_PATH   FFprobe executable (otherwise beside runtime or on PATH)\n  \
+             APP_PATH              Runtime settings and data directory\n\n\
+             Desktop playback uses MPV. Browser conversion uses the bundled FFmpeg tools.",
+            env!("CARGO_PKG_VERSION")
+        );
+        return Ok(());
+    }
     init_logging();
     let multi_user = std::env::args().any(|arg| arg == "--multi-user");
     info!(
@@ -518,6 +535,7 @@ async fn main() -> anyhow::Result<()> {
                     connect_timeout: Some(Duration::from_secs(8)),
                     read_write_timeout: Some(Duration::from_secs(30)),
                     keep_alive_interval: Some(Duration::from_secs(60)),
+                    ..Default::default()
                 }),
                 ..Default::default()
             }),
@@ -533,7 +551,7 @@ async fn main() -> anyhow::Result<()> {
             runtime_worker_threads: Some(4),
             // Keep the persisted routing table, but never reuse its UDP port. Windows can reserve
             // a previously valid dynamic port between launches, which otherwise aborts startup.
-            dht_config: Some(PersistentDhtConfig {
+            dht: Some(DhtSessionConfig {
                 port: Some(0),
                 ..Default::default()
             }),
@@ -597,16 +615,7 @@ async fn main() -> anyhow::Result<()> {
         .timeout(Duration::from_secs(90))
         .build()
         .context("building HTTP client")?;
-    let proxy_client = reqwest::Client::builder()
-        .user_agent("stremio-service-rs/0.1")
-        .http1_only()
-        .redirect(reqwest::redirect::Policy::none())
-        .danger_accept_invalid_certs(true)
-        .danger_accept_invalid_hostnames(true)
-        .connect_timeout(Duration::from_secs(15))
-        .timeout(Duration::from_secs(90))
-        .build()
-        .context("building proxy HTTP client")?;
+    let proxy_client = build_proxy_http_client()?;
     let download_client = reqwest::Client::builder()
         .user_agent("stremio-service-rs/0.1")
         .http1_only()
@@ -624,6 +633,7 @@ async fn main() -> anyhow::Result<()> {
         .context("starting downloader manager")?,
     );
 
+    let hls = media_hls::HlsService::new();
     let state = AppState {
         torrents,
         base_url: Arc::new(RwLock::new(base_url.clone())),
@@ -632,6 +642,7 @@ async fn main() -> anyhow::Result<()> {
         settings,
         local_addon: Arc::new(LocalAddonIndex::default()),
         downloads,
+        hls: hls.clone(),
     };
 
     let app = router(state);
@@ -639,13 +650,36 @@ async fn main() -> anyhow::Result<()> {
     info!("{STARTUP_NAME} listening on {base_url}");
     // this line is needed for the service to work with non-modified Stremio clients, as they rely on it to detect the server and get its URL
     println!("EngineFS server started at {base_url}");
-    axum::serve(
+    let shutdown_hls = hls.clone();
+    let serving = axum::serve(
         listener,
         app.into_make_service_with_connect_info::<SocketAddr>(),
     )
+    .with_graceful_shutdown(async move {
+        shutdown_signal().await;
+        shutdown_hls.shutdown().await;
+    })
     .await
-    .context("serving HTTP")?;
+    .context("serving HTTP");
+    hls.shutdown().await;
+    serving?;
     Ok(())
+}
+
+async fn shutdown_signal() {
+    #[cfg(unix)]
+    {
+        if let Ok(mut terminate) =
+            tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+        {
+            tokio::select! {
+                _ = tokio::signal::ctrl_c() => {},
+                _ = terminate.recv() => {},
+            }
+            return;
+        }
+    }
+    let _ = tokio::signal::ctrl_c().await;
 }
 
 fn init_logging() {
@@ -694,7 +728,10 @@ fn router(state: AppState) -> Router {
         .route("/subtitlesTracks", get(subtitles_tracks))
         .route("/subtitles.{ext}", get(subtitles_proxy))
         .route("/probe", get(media_probe::probe))
-        .route("/hlsv2/probe", any(probe))
+        .route("/hlsv2/probe", get(media_probe::hls_probe))
+        .route("/hlsv2/status", get(hls_status))
+        .route("/hlsv2/{id}/destroy", get(hls_destroy))
+        .route("/hlsv2/{id}/{*rest}", get(hls_path))
         .route("/stats.json", get(global_stats))
         .route("/removeAll", get(remove_all))
         .route("/create", any(create_from_torrent))
@@ -999,6 +1036,29 @@ include!("runtime/downloader.rs");
 #[path = "runtime/probe.rs"]
 mod media_probe;
 
+#[path = "runtime/hls.rs"]
+mod media_hls;
+
+async fn hls_path(
+    State(state): State<AppState>,
+    AxumPath((id, rest)): AxumPath<(String, String)>,
+    RawQuery(raw_query): RawQuery,
+) -> Response {
+    let base = state.base_url.read().await.clone();
+    state
+        .hls
+        .handle(&id, &rest, raw_query.as_deref(), &base)
+        .await
+}
+
+async fn hls_status(State(state): State<AppState>) -> Json<Value> {
+    Json(state.hls.status().await)
+}
+
+async fn hls_destroy(State(state): State<AppState>, AxumPath(id): AxumPath<String>) -> Response {
+    state.hls.destroy(&id).await
+}
+
 include!("runtime/torrent_http.rs");
 
 include!("runtime/torrent_service.rs");
@@ -1170,7 +1230,7 @@ mod tests {
         let session = Session::new_with_opts(
             initial_cache.clone(),
             SessionOptions {
-                disable_dht: true,
+                dht: None,
                 disable_trackers: true,
                 disable_local_service_discovery: true,
                 ..Default::default()

@@ -90,6 +90,7 @@ impl TorrentService {
                         connect_timeout: Some(Duration::from_secs(8)),
                         read_write_timeout: Some(Duration::from_secs(30)),
                         keep_alive_interval: Some(Duration::from_secs(60)),
+                        ..Default::default()
                     }),
                     force_tracker_interval: Some(Duration::from_secs(120)),
                     only_files: request

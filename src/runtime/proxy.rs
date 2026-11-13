@@ -1,3 +1,35 @@
+const PROXY_RESPONSE_HEADERS_TIMEOUT: Duration = Duration::from_secs(90);
+const PROXY_PLAYLIST_BODY_TIMEOUT: Duration = Duration::from_secs(90);
+
+#[derive(Clone, Copy)]
+struct ProxyTimeouts {
+    response_headers: Duration,
+    playlist_body: Duration,
+}
+
+impl Default for ProxyTimeouts {
+    fn default() -> Self {
+        Self {
+            response_headers: PROXY_RESPONSE_HEADERS_TIMEOUT,
+            playlist_body: PROXY_PLAYLIST_BODY_TIMEOUT,
+        }
+    }
+}
+
+fn build_proxy_http_client() -> anyhow::Result<reqwest::Client> {
+    // A media response can remain active for hours. Reqwest's total timeout
+    // also covers its body, so only connecting and obtaining headers are bounded.
+    reqwest::Client::builder()
+        .user_agent("stremio-service-rs/0.1")
+        .http1_only()
+        .redirect(reqwest::redirect::Policy::none())
+        .danger_accept_invalid_certs(true)
+        .danger_accept_invalid_hostnames(true)
+        .connect_timeout(Duration::from_secs(15))
+        .build()
+        .context("building proxy HTTP client")
+}
+
 #[derive(Debug, Clone)]
 struct ProxyOpts {
     destination_origin: String,
@@ -134,6 +166,7 @@ fn proxy_build_downstream_headers(upstream: &HeaderMap, overrides: &[String]) ->
     for name in [
         ACCEPT_RANGES,
         CONTENT_TYPE,
+        http::header::CONTENT_ENCODING,
         CONTENT_LENGTH,
         CONTENT_RANGE,
         CONNECTION,
@@ -346,6 +379,27 @@ async fn proxy_impl(
     request_headers: HeaderMap,
     raw_query: Option<String>,
 ) -> Response {
+    proxy_response(
+        &state.proxy_client,
+        opts_raw,
+        pathname,
+        method,
+        request_headers,
+        raw_query,
+        ProxyTimeouts::default(),
+    )
+    .await
+}
+
+async fn proxy_response(
+    client: &reqwest::Client,
+    opts_raw: String,
+    pathname: String,
+    method: Method,
+    request_headers: HeaderMap,
+    raw_query: Option<String>,
+    timeouts: ProxyTimeouts,
+) -> Response {
     let opts = match proxy_opts_parse(&opts_raw) {
         Ok(opts) => opts,
         Err(err) => {
@@ -389,16 +443,18 @@ async fn proxy_impl(
     let mut redirect_count = 0usize;
     let mut current = dest.clone();
     let response = loop {
-        let result = state
-            .proxy_client
-            .request(method.clone(), current.clone())
-            .headers(upstream_headers.clone())
-            .send()
-            .await;
+        let result = timeout(
+            timeouts.response_headers,
+            client
+                .request(method.clone(), current.clone())
+                .headers(upstream_headers.clone())
+                .send(),
+        )
+        .await;
 
         let result = match result {
-            Ok(result) => result,
-            Err(err) => {
+            Ok(Ok(result)) => result,
+            Ok(Err(err)) => {
                 return (
                     StatusCode::INTERNAL_SERVER_ERROR,
                     [(
@@ -406,6 +462,13 @@ async fn proxy_impl(
                         HeaderValue::from_static("text/plain; charset=utf-8"),
                     )],
                     format!("Proxy upstream request failed: {err}"),
+                )
+                    .into_response();
+            }
+            Err(_) => {
+                return (
+                    StatusCode::GATEWAY_TIMEOUT,
+                    "Proxy upstream response headers timed out",
                 )
                     .into_response();
             }
@@ -501,9 +564,9 @@ async fn proxy_impl(
 
     let status = response.status();
     if is_playlist {
-        let bytes = match response.bytes().await {
-            Ok(bytes) => bytes,
-            Err(err) => {
+        let bytes = match timeout(timeouts.playlist_body, response.bytes()).await {
+            Ok(Ok(bytes)) => bytes,
+            Ok(Err(err)) => {
                 return (
                     StatusCode::INTERNAL_SERVER_ERROR,
                     [(
@@ -511,6 +574,13 @@ async fn proxy_impl(
                         HeaderValue::from_static("text/plain; charset=utf-8"),
                     )],
                     format!("Proxy upstream read failed: {err}"),
+                )
+                    .into_response();
+            }
+            Err(_) => {
+                return (
+                    StatusCode::GATEWAY_TIMEOUT,
+                    "Proxy upstream playlist body timed out",
                 )
                     .into_response();
             }
@@ -537,9 +607,54 @@ async fn proxy_impl(
         *resp.headers_mut() = response_headers;
         resp
     } else {
-        let stream = response
-            .bytes_stream()
-            .map_err(|err| std::io::Error::new(std::io::ErrorKind::Other, err));
+        let expected_bytes = if method == Method::HEAD
+            || matches!(status, StatusCode::NO_CONTENT | StatusCode::NOT_MODIFIED)
+        {
+            Some(0)
+        } else {
+            response.content_length()
+        };
+        // Origins identify the failing provider without logging signed URL paths
+        // or queries. Preserve body errors so truncated media is not a clean EOF.
+        let upstream_origin = url_origin(response.url()).unwrap_or_default();
+        let stream = futures_util::stream::try_unfold(
+            (response.bytes_stream(), 0u64, upstream_origin),
+            move |(mut stream, transferred, upstream_origin)| async move {
+                match stream.try_next().await {
+                    Ok(Some(chunk)) => {
+                        let transferred = transferred.saturating_add(chunk.len() as u64);
+                        Ok(Some((chunk, (stream, transferred, upstream_origin))))
+                    }
+                    Ok(None) => {
+                        if expected_bytes.is_some_and(|expected| transferred != expected) {
+                            warn!(
+                                upstream_origin,
+                                transferred_bytes = transferred,
+                                expected_bytes,
+                                "proxy upstream body ended before its advertised length"
+                            );
+                            Err(std::io::Error::new(
+                                std::io::ErrorKind::UnexpectedEof,
+                                "proxy upstream body ended before its advertised length",
+                            ))
+                        } else {
+                            Ok(None)
+                        }
+                    }
+                    Err(err) => {
+                        let err = err.without_url();
+                        warn!(
+                            upstream_origin,
+                            transferred_bytes = transferred,
+                            expected_bytes,
+                            error = %err,
+                            "proxy upstream body failed"
+                        );
+                        Err(std::io::Error::other(err))
+                    }
+                }
+            },
+        );
         let body = Body::from_stream(stream);
 
         let mut resp = Response::builder()
@@ -549,4 +664,9 @@ async fn proxy_impl(
         *resp.headers_mut() = response_headers;
         resp
     }
+}
+
+#[cfg(test)]
+mod proxy_tests {
+    include!("proxy_tests.rs");
 }

@@ -1,0 +1,79 @@
+{
+  "sources": {
+    "ffmpeg": {
+      "version": "9.0.2",
+      "revision": "946fcce07b6dcd0331c8cc609192aeff5e1924f8",
+      "url": "https://codeload.github.com/FFmpeg/FFmpeg/tar.gz/946fcce07b6dcd0331c8cc609192aeff5e1924f8",
+      "sha256": "0aa2b1de2a5698b20a23e93d539a9a8e82ca0117496c5bdf05d198805f42bb3b"
+    },
+    "x264": {
+      "revision": "c24e06c2e184345ceb33eb20a15d1024d9fd3497",
+      "url": "https://codeload.github.com/mirror/x264/tar.gz/c24e06c2e184345ceb33eb20a15d1024d9fd3497",
+      "sha256": "090d730e867fc63631782a1287974635d1237d0fa7c6fd1d09fd543620a56689"
+    },
+    "dav1d": {
+      "version": "1.5.4",
+      "revision": "54706fc6bc0cdecab7e9593974a4039cc038fca7",
+      "url": "https://codeload.github.com/videolan/dav1d/tar.gz/54706fc6bc0cdecab7e9593974a4039cc038fca7",
+      "sha256": "9edb11a2108b375cc58370354e705feebc93430bb780130363815c1e1ac0c250"
+    },
+    "freetype": {
+      "version": "2.14.3",
+      "revision": "0a0221a1347e2f1e07c395263540026e9a0aa7c7",
+      "url": "https://codeload.github.com/freetype/freetype/tar.gz/0a0221a1347e2f1e07c395263540026e9a0aa7c7",
+      "sha256": "11cd478953fc1d382f20a233b8e2aed6c31b47cbf0568c4bdb3334bcc1550698"
+    },
+    "harfbuzz": {
+      "version": "15.1.0",
+      "revision": "3df40d9b98d6b32f0e4288d4ecfbb158ddb3a372",
+      "url": "https://codeload.github.com/harfbuzz/harfbuzz/tar.gz/3df40d9b98d6b32f0e4288d4ecfbb158ddb3a372",
+      "sha256": "ae2c028546880de8ac2a4616a3d437ecfc50140b31eace909aa61a29d0623cdd"
+    },
+    "fribidi": {
+      "version": "1.0.18",
+      "revision": "15393e4937aa95bcf865d92143735746aeb654fa",
+      "url": "https://codeload.github.com/fribidi/fribidi/tar.gz/15393e4937aa95bcf865d92143735746aeb654fa",
+      "sha256": "3e8c03cf8182ff3570a3696c7efd3c456f1fcf288a509b588abe67fc2ff4f630"
+    },
+    "libass": {
+      "version": "0.17.5",
+      "revision": "4a05d8127f525943ebf45fdc6497c9e665947f0d",
+      "url": "https://codeload.github.com/libass/libass/tar.gz/4a05d8127f525943ebf45fdc6497c9e665947f0d",
+      "sha256": "3546ecc8748c62e100a9dd18e52ea2d17d7facedf89cfcad97000ad60b1bce2b"
+    },
+    "libiconv": {
+      "version": "1.19.1",
+      "platforms": ["windows-x64", "windows-arm64"],
+      "revision": "1.19.1",
+      "url": "https://ftp.gnu.org/gnu/libiconv/libiconv-1.19.1.tar.gz",
+      "sha256": "9a06844846d664d7122161700c10a64480d7c7bcead3091925a785b38c91edab"
+    },
+    "fontconfig": {
+      "version": "2.18.3",
+      "platforms": ["linux-x64", "linux-arm64"],
+      "revision": "0f236723a3c26bd9745e32ba2b3ee21e5f809295",
+      "url": "https://codeload.github.com/fontconfig/fontconfig/tar.gz/0f236723a3c26bd9745e32ba2b3ee21e5f809295",
+      "sha256": "3e23f526b5fdb12d92a2b87ebcf2aba27ec9e75113a86f71d5b79ea1669df9bb"
+    },
+    "expat": {
+      "version": "2.10.0",
+      "platforms": ["linux-x64", "linux-arm64"],
+      "revision": "a70841d9ffa64ddde29ab824ed6305035ebe4c47",
+      "url": "https://codeload.github.com/libexpat/libexpat/tar.gz/a70841d9ffa64ddde29ab824ed6305035ebe4c47",
+      "sha256": "165b3fe7561caf01adef27b68587d6579166060b04e3e88561ec788f4be0e893"
+    },
+    "openssl": {
+      "version": "3.5.9",
+      "platforms": ["linux-x64", "linux-arm64"],
+      "revision": "45e844fa2a14ec92d146bd8f5778ac130b6625fb",
+      "url": "https://codeload.github.com/openssl/openssl/tar.gz/45e844fa2a14ec92d146bd8f5778ac130b6625fb",
+      "sha256": "f54250b21795bb01240f3f9b42c384868d04460e339e39275aaaf93487f2d903"
+    }
+  },
+  "fonts": {
+    "version": "2.37",
+    "file": "dejavu-fonts-ttf-2.37.tar.bz2",
+    "url": "https://github.com/dejavu-fonts/dejavu-fonts/releases/download/version_2_37/dejavu-fonts-ttf-2.37.tar.bz2",
+    "sha256": "fa9ca4d13871dd122f61258a80d01751d603b4d3ee14095d65453b4e846e17d7"
+  }
+}

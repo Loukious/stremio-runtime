@@ -1,0 +1,12 @@
+{
+  "name": "stremio-runtime-web-verification",
+  "private": true,
+  "scripts": { "build": "node build.mjs" },
+  "dependencies": {
+    "@stremio/stremio-video": "0.0.103",
+    "esbuild": "0.25.12"
+  },
+  "overrides": {
+    "vtt.js": "https://codeload.github.com/jaruba/vtt.js/tar.gz/84d33d157848407d790d78423dacc41a096294f0"
+  }
+}
